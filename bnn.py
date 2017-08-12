@@ -14,7 +14,6 @@ import xgboost as xgb
 from torch.autograd import Variable
 from tqdm import trange
 
-from func import bernoulli_lift_level
 from log_to_file import Logger
 
 
@@ -177,6 +176,11 @@ class BoostNN:
     def train_booster_layer(self, dmatrix, grad, hess):
         """
         Train a booster layer.
+
+        :type dmatrix:  xgboost.core.DMatrix
+        :type grad:     numpy.ndarray
+        :type hess:     numpy.ndarray
+
         :param dmatrix: a dmatrix of
                         [
                             batch_size * add_booster_layer_after_n_batch,
@@ -207,18 +211,18 @@ class BoostNN:
             for first_dim_idx in range(self.first_dim_from_boosting):
                 for second_dim_idx in range(self.second_dim_from_boosting):
 
-                    abs_sum_of_grad = np.mean(
+                    abs_ave_of_grad = np.mean(
                         np.abs(
                             grad[:, channel_idx, first_dim_idx, second_dim_idx]
                         )
                     )
 
-                    if abs_sum_of_grad > 0.0:
+                    if abs_ave_of_grad > 0.0:
                         # add a booster layer
                         self._add_booster_layer(channel_idx, first_dim_idx, second_dim_idx)
 
                         scaling_coef = \
-                            abs_sum_of_grad \
+                            abs_ave_of_grad \
                             / np.mean(
                                 np.abs(
                                     hess[:, channel_idx, first_dim_idx, second_dim_idx]
@@ -438,25 +442,52 @@ class BoostNN:
 
 
 class DataLoader:
-    def __init__(self, data, target, batch_size, nn_input_shape):
+    def __init__(self, data, target, batch_size, nn_input_shape, e_exp=None, weight=None):
         if not (isinstance(data, np.ndarray) and isinstance(target, np.ndarray)):
             raise ValueError('Error: data or target is not numpy.ndarray.')
-
         if not (data.ndim == 4 and (target.ndim == 2 or target.ndim == 4)):
             raise ValueError('Error: data should be four-dimensional and target should be two-dimensional.')
-
         if data.shape[0] != target.shape[0]:
             raise ValueError('Error: The numbers of samples in data and target should be the same.')
-
-        if not (data.dtype == 'float32' and target.dtype == 'float32'):
-            warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
 
         if batch_size > data.shape[0]:
             warn('batch_size is larger than the sample size, so DataLoader forces batch_size to be the sample size.')
             batch_size = data.shape[0]
 
-        self.data = data
-        self.target = target
+        if not (data.dtype == 'float32' and target.dtype == 'float32'):
+            warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
+            self.data = data.astype('float32')
+            self.target = target.astype('float32')
+        else:
+            self.data = data
+            self.target = target
+
+        if e_exp is None:
+            self.e_exp = np.ones_like(target, dtype='float32')
+        else:
+            if not isinstance(e_exp, np.ndarray):
+                raise ValueError('Error: e_exp is not numpy.ndarray.')
+            if not e_exp.ndim == 2:
+                raise ValueError('Error: e_exp should be a two-dimensional column vector.')
+            if e_exp.dtype == 'float32':
+                self.e_exp = e_exp
+            else:
+                warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
+                self.e_exp = e_exp.astype('float32')
+
+        if weight is None:
+            self.weight = np.ones_like(target, dtype='float32')
+        else:
+            if not isinstance(weight, np.ndarray):
+                raise ValueError('Error: weight is not numpy.ndarray.')
+            if not weight.ndim == 2:
+                raise ValueError('Error: weight should be a two-dimensional column vector.')
+            if weight.dtype == 'float32':
+                self.weight = weight
+            else:
+                warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
+                self.weight = weight.astype('float32')
+
         self.batch_size = int(batch_size)
 
         self.original_sample_n = data.shape[0]
@@ -500,12 +531,16 @@ class DataLoader:
 
     def get_data_for_nn(self):
         return self.margin[self.sample_idx_in_current_batch_list], \
-               self.target[self.sample_idx_in_current_batch_list]
+               self.target[self.sample_idx_in_current_batch_list], \
+               self.e_exp[self.sample_idx_in_current_batch_list], \
+               self.weight[self.sample_idx_in_current_batch_list],
 
     def get_data_for_booster_layer(self):
         return self.data[self.used_sample_index_list], \
                self.margin[self.used_sample_index_list], \
-               self.target[self.used_sample_index_list]
+               self.target[self.used_sample_index_list], \
+               self.e_exp[self.used_sample_index_list], \
+               self.weight[self.used_sample_index_list]
 
     def get_length_of_data_for_booster_layer(self):
         return self.used_sample_index_list.__len__()
@@ -569,6 +604,11 @@ class Trainer:
         self.val_data = None
         self.val_target = None
 
+        self.train_e_exp = None
+        self.train_weight = None
+        self.val_e_exp = None
+        self.val_weight = None
+
         self.train_set_loader = None
         self.val_set_loader = None
 
@@ -599,18 +639,27 @@ class Trainer:
     def _blank_spaces(phase):
         return ' ' * (' ' + phase + ' %6d, ' % 0).__len__()
 
-    def input_data(self, train_data, train_target, val_data, val_target, make_copy_of_data=False):
+    def input_data(self, train_data, train_target, val_data, val_target, make_copy_of_data=False,
+                   train_e_exp=None, train_weight=None, val_e_exp=None, val_weight=None):
 
         if make_copy_of_data:
             self.train_data = deepcopy(train_data)
             self.train_target = deepcopy(train_target)
             self.val_data = deepcopy(val_data)
             self.val_target = deepcopy(val_target)
+            self.train_e_exp = deepcopy(train_e_exp)
+            self.train_weight = deepcopy(train_weight)
+            self.val_e_exp = deepcopy(val_e_exp)
+            self.val_weight = deepcopy(val_weight)
         else:
             self.train_data = train_data
             self.train_target = train_target
             self.val_data = val_data
             self.val_target = val_target
+            self.train_e_exp = train_e_exp
+            self.train_weight = train_weight
+            self.val_e_exp = val_e_exp
+            self.val_weight = val_weight
 
         if self.train_param['normalize_to_0_1']:
             self.train_data -= self.train_data[~np.isnan(self.train_data)].min()
@@ -639,7 +688,9 @@ class Trainer:
                 self.model.n_channel_from_boosting,
                 self.model.first_dim_from_boosting,
                 self.model.second_dim_from_boosting
-            ]
+            ],
+            e_exp=train_e_exp,
+            weight=train_weight
         )
 
         self.val_set_loader = DataLoader(
@@ -650,7 +701,9 @@ class Trainer:
                 self.model.n_channel_from_boosting,
                 self.model.first_dim_from_boosting,
                 self.model.second_dim_from_boosting
-            ]
+            ],
+            e_exp=val_e_exp,
+            weight=val_weight
         )
         self.logger.log('train_set_loader and val_set_loader DONE.\n', 'Trainer.input_data()')
 
@@ -692,12 +745,16 @@ class Trainer:
                 self.hess_ma_coef * self.ma_hess_array \
                 + (1.0 - self.hess_ma_coef) * hess_long_double_array
 
-    def _nn_step(self, margin_float_array, target_float_array, mode):
+    def _nn_step(self, margin_float_array, target_float_array, e_exp_float_array, weight_float_array, mode):
 
         if self.model.enable_cuda:
             target_float_variable = Variable(torch.from_numpy(target_float_array).cuda())
+            e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array).cuda())
+            weight_float_variable = Variable(torch.from_numpy(weight_float_array).cuda())
         else:
             target_float_variable = Variable(torch.from_numpy(target_float_array))
+            e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array))
+            weight_float_variable = Variable(torch.from_numpy(weight_float_array))
 
         if mode == 'loss_and_backward_and_update':
 
@@ -710,13 +767,16 @@ class Trainer:
 
             corrected_target_float_variable = self._correct_target(
                 output_float_variable,
-                target_float_variable
+                target_float_variable,
+                e_exp_float_variable
             )
 
             loss_variable, display_loss_variable = self._cal_loss(
                 output_float_variable,
                 target_float_variable,
-                corrected_target_float_variable
+                e_exp_float_variable,
+                weight_float_variable,
+                corrected_target_float_variable,
             )
 
             loss_variable.backward()
@@ -735,21 +795,24 @@ class Trainer:
 
             corrected_target_float_variable = self._correct_target(
                 output_float_variable,
-                target_float_variable
+                target_float_variable,
+                e_exp_float_variable
             )
 
             loss_variable, display_loss_variable = self._cal_loss(
                 output_float_variable,
                 target_float_variable,
+                e_exp_float_variable,
+                weight_float_variable,
                 corrected_target_float_variable
             )
 
             loss_variable.backward()
 
             return loss_variable.data[0], \
-                   display_loss_variable.data[0], \
-                   output_float_variable, \
-                   corrected_target_float_variable
+                display_loss_variable.data[0], \
+                output_float_variable, \
+                corrected_target_float_variable
 
         elif mode == 'loss':
 
@@ -761,6 +824,8 @@ class Trainer:
             display_loss_variable = self._cal_loss(
                 output_float_variable,
                 target_float_variable,
+                e_exp_float_variable,
+                weight_float_variable,
             )
 
             if self.model.enable_cuda:
@@ -802,7 +867,7 @@ class Trainer:
 
         self.count_of_booster_layer_training += 1
 
-    def _correct_target(self, output_float_variable, target_float_variable):
+    def _correct_target(self, output_float_variable, target_float_variable, e_exp_float_variable):
         """
         Correct outputs
         :param output_float_variable:       a torch variable of
@@ -836,56 +901,63 @@ class Trainer:
         :return:                            a torch variable of the same shape of output and target
         """
 
-        corrected_target_float_variable = \
-            self.target_regularization_coef \
-            * target_float_variable \
-            + \
-            (1.0 - self.target_regularization_coef) \
-            * self.model.nn_loss.link(output_float_variable)
+        if self.target_regularization_coef == 1.0:
+            return target_float_variable
 
-        return corrected_target_float_variable
+        else:
+            corrected_target_float_variable = \
+                self.target_regularization_coef \
+                * target_float_variable \
+                + \
+                (1.0 - self.target_regularization_coef) \
+                * self.model.nn_loss.torch_link(output_float_variable, e_exp_float_variable)
+            return corrected_target_float_variable
 
-    def _cal_loss(self, output_float_variable, target_float_variable, corrected_target_float_variable=None):
+    def _cal_loss(self, output_float_variable, target_float_variable, e_exp_float_variable, weight_float_variable,
+                  corrected_target_float_variable=None):
 
         loss_variable = None
 
-        if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
-
-            if corrected_target_float_variable:
-                loss_variable = self.model.nn_loss(
-                    output_float_variable,
-                    corrected_target_float_variable
-                )
-
-            display_loss_variable = self.model.nn_loss(
+        if corrected_target_float_variable:
+            loss_variable = self.model.nn_loss(
                 output_float_variable,
-                target_float_variable
+                corrected_target_float_variable,
+                e_exp_float_variable,
+                weight_float_variable
             )
 
-        elif self.model.nn_loss.__class__.__name__ == 'FeatureNormalizedMSE':
+        display_loss_variable = self.model.nn_loss(
+            output_float_variable,
+            target_float_variable,
+            e_exp_float_variable,
+            weight_float_variable
+        )
 
-            if corrected_target_float_variable:
-                loss_variable = self.model.nn_loss(
-                    output_float_variable.double(),
-                    corrected_target_float_variable,
-                    1.0 / self.std_per_feature_float_tensor
-                )
-
-            display_loss_variable = self.model.nn_loss(
-                output_float_variable,
-                target_float_variable,
-                1.0 / self.std_per_feature_float_tensor
-            )
-
-        else:
-            raise NotImplementedError
+        # elif self.model.nn_loss.__class__.__name__ == 'FeatureNormalizedMSE':
+        #
+        #     if corrected_target_float_variable:
+        #         loss_variable = self.model.nn_loss(
+        #             output_float_variable.double(),
+        #             corrected_target_float_variable,
+        #             1.0 / self.std_per_feature_float_tensor
+        #         )
+        #
+        #     display_loss_variable = self.model.nn_loss(
+        #         output_float_variable,
+        #         target_float_variable,
+        #         1.0 / self.std_per_feature_float_tensor
+        #     )
+        #
+        # else:
+        #     raise NotImplementedError
 
         if corrected_target_float_variable:
             return loss_variable, display_loss_variable
         else:
             return display_loss_variable
 
-    def _cal_grad_and_hess(self, output_float_variable, corrected_target_float_variable):
+    def _cal_grad_and_hess(self, output_float_variable, corrected_target_float_variable,
+                           e_exp_float_array, weight_float_array):
 
         if self.model.enable_cuda:
             grad_long_double_array = \
@@ -903,20 +975,13 @@ class Trainer:
                     .numpy() \
                     .astype('longdouble')
 
-        if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
-
-            hess_long_double_array = self.model.nn_loss.hess(
-                grad_long_double_array,
-                torch.exp(output_float_variable.data).cpu().numpy().astype('longdouble'),
-                corrected_target_float_variable.data.cpu().numpy().astype('longdouble')
-            )
-
-        elif self.model.nn_loss.__class__.__name__ == 'FeatureNormalizedMSE':
-
-            hess_long_double_array = self.model.nn_loss.hess(grad_long_double_array)
-
-        else:
-            raise NotImplementedError
+        hess_long_double_array = self.model.nn_loss.hess(
+            grad_long_double_array,
+            output_float_variable.data.cpu().numpy().astype('longdouble'),
+            corrected_target_float_variable.data.cpu().numpy().astype('longdouble'),
+            e_exp_float_array.astype('longdouble'),
+            weight_float_array.astype('longdouble')
+        )
 
         return grad_long_double_array, hess_long_double_array
 
@@ -933,10 +998,13 @@ class Trainer:
 
             time_start = time()
 
-            margin_float_array, target_float_array = self.train_set_loader.get_data_for_nn()
+            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
+                self.train_set_loader.get_data_for_nn()
             loss, display_loss = self._nn_step(
                 margin_float_array,
                 target_float_array,
+                e_exp_float_array,
+                weight_float_array,
                 'loss_and_backward_and_update'
             )
 
@@ -986,24 +1054,28 @@ class Trainer:
 
             if add_booster_layer:
 
-                data_float_array, _, target_float_array = \
+                data_float_array, _, target_float_array, e_exp_float_array, weight_float_array = \
                     self.train_set_loader.get_data_for_booster_layer()
 
                 for booster_layer_idx in range(self.train_param['n_booster_layer_to_add']):
                     time_start = time()
 
-                    _, margin_float_array, _ = \
+                    _, margin_float_array, _, _, _ = \
                         self.train_set_loader.get_data_for_booster_layer()
 
                     loss, display_loss, output_float_variable, corrected_target_float_variable = self._nn_step(
                         margin_float_array,
                         target_float_array,
+                        e_exp_float_array,
+                        weight_float_array,
                         'loss_and_backward'
                     )
 
                     grad_long_double_array, hess_long_double_array = self._cal_grad_and_hess(
                         output_float_variable,
-                        corrected_target_float_variable
+                        corrected_target_float_variable,
+                        e_exp_float_array,
+                        weight_float_array,
                     )
 
                     self.grad_scale_list.append(np.mean(np.abs(grad_long_double_array)))
@@ -1150,25 +1222,31 @@ class Trainer:
 
         target_float_array_list = None
         output_float_array_list = None
+        e_exp_float_array_list = None
         if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
             target_float_array_list = []
             output_float_array_list = []
+            e_exp_float_array_list = []
 
         self.val_set_loader.start_new_round(shuffle=False)
 
         while self.val_set_loader.next_batch():
 
-            margin_float_array, target_float_array = self.val_set_loader.get_data_for_nn()
+            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
+                self.val_set_loader.get_data_for_nn()
 
             display_loss, output_float_array = self._nn_step(
                 margin_float_array,
                 target_float_array,
+                e_exp_float_array,
+                weight_float_array,
                 'loss'
             )
 
             if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
                 target_float_array_list.append(target_float_array)
                 output_float_array_list.append(output_float_array)
+                e_exp_float_array_list.append(e_exp_float_array)
 
             running_display_loss += display_loss
 
@@ -1194,11 +1272,13 @@ class Trainer:
 
             total_target = np.concatenate(target_float_array_list)
             total_output = np.concatenate(output_float_array_list)
+            total_e_exp = np.concatenate(e_exp_float_array_list)
 
-            pct = bernoulli_lift_level(
-                total_target[:, 0],
-                total_output[:, 0],
-                self.train_param['lift_level_at']
+            pct = self.model.nn_loss.lift_level(
+                total_output,
+                total_target,
+                self.train_param['lift_level_at'],
+                e_exp_float_array=total_e_exp
             )
             self.logger.log(
                 ' Epoch %6d ==>> accuracy achieved for %.4f %% of top predictions: %.4f %% \n\n' %
@@ -1228,11 +1308,14 @@ class Trainer:
         self.train_set_loader.start_new_round(shuffle=False)
 
         while self.train_set_loader.next_batch():
-            margin_float_array, target_float_array = self.train_set_loader.get_data_for_nn()
+            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
+                self.train_set_loader.get_data_for_nn()
 
             display_loss, _ = self._nn_step(
                 margin_float_array,
                 target_float_array,
+                e_exp_float_array,
+                weight_float_array,
                 'loss'
             )
 
@@ -1285,12 +1368,14 @@ class Trainer:
             if add_booster_layer:
                 time_start = time()
 
-                data_float_array, margin_float_array, target_float_array = \
+                data_float_array, margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
                     self.train_set_loader.get_data_for_booster_layer()
 
                 loss, display_loss, output_float_variable, corrected_target_float_variable = self._nn_step(
                     margin_float_array,
                     target_float_array,
+                    e_exp_float_array,
+                    weight_float_array,
                     'loss_and_backward'
                 )
 
@@ -1299,7 +1384,9 @@ class Trainer:
 
                 grad_long_double_array, hess_long_double_array = self._cal_grad_and_hess(
                     output_float_variable,
-                    corrected_target_float_variable
+                    corrected_target_float_variable,
+                    e_exp_float_array,
+                    weight_float_array
                 )
 
                 self.grad_scale_list.append(np.mean(np.abs(grad_long_double_array)))
@@ -1440,20 +1527,20 @@ class Trainer:
 
     def _init_variables_for_recording(self):
 
-        if not self.count_of_booster_layer_training:
+        if self.count_of_booster_layer_training is None:
             self.count_of_booster_layer_training = 0
 
-        if not self.average_tr_loss_list:
+        if self.average_tr_loss_list is None:
             self.average_tr_loss_list = []
-        if not self.average_val_loss_list:
+        if self.average_val_loss_list is None:
             self.average_val_loss_list = []
 
-        if not self.grad_scale_list:
+        if self.grad_scale_list is None:
             self.grad_scale_list = []
-        if not self.hess_scale_list:
+        if self.hess_scale_list is None:
             self.hess_scale_list = []
 
-        if not self.val_acc_list:
+        if self.val_acc_list is None:
             if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
                 self.val_acc_list = []
             elif self.model.nn_loss.__class__.__name__ == 'FeatureNormalizedMSE':
@@ -1633,7 +1720,7 @@ class Trainer:
     def detect_anomaly(self, train_labels, val_labels, threshold):
 
         train_prediction_float_array = self.model.predict(self.train_data)
-        train_loss = self.model.nn_loss.individial_loss(
+        train_loss = self.model.nn_loss.individual_loss(
             train_prediction_float_array,
             self.train_target,
             1.0 / self.std_per_feature_float_tensor
