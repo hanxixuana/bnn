@@ -241,6 +241,56 @@ def get_insurance_data_for_classification(path='./data/insurance/processed_ins_d
            return_val_target
 
 
+def get_exp_ins_data_for_classification(path='./data/insurance/processed_ins_data/', validate_proportion=0.3):
+    """
+    Get insurance data.
+    :param path: the folder where the data is located
+    :param validate_proportion: a proportion for validating with the rest for training
+    :param random_seed: the seed to fix randomness
+    :return: [n_sample, 35] numpy array for training
+             [n_sample, 1] numpy array for training containing targets in the 1st column
+             [n_sample, 1] numpy array of exponential exposure
+             [n_sample, 35] numpy array for validation
+             [n_sample, 1] numpy array for validation containing targets in the 1st column
+             [n_sample, 1] numpy array of exponential exposure
+
+    """
+
+    features = pd.read_csv(path + 'features.csv', delimiter=',', header=None)
+    targets = pd.read_csv(path + 'targets.csv', delimiter=',', header=None)
+    eexp = pd.read_csv(path + 'eexp.csv', delimiter=',', header=None)
+
+    n_sample = features.shape[0]
+    validate_n_sample = int(n_sample * validate_proportion)
+
+    shuffled_index = np.random.permutation(range(n_sample)).tolist()
+
+    # ===
+    train_data = features.ix[shuffled_index[validate_n_sample:], :]
+    train_target = targets.ix[shuffled_index[validate_n_sample:], :]
+    train_eexp = eexp.ix[shuffled_index[validate_n_sample:], :]
+
+    validate_data = features.ix[shuffled_index[:validate_n_sample], :]
+    validate_target = targets.ix[shuffled_index[:validate_n_sample], :]
+    validate_eexp = eexp.ix[shuffled_index[:validate_n_sample], :]
+
+    # ===
+    return_train_data = train_data.as_matrix().reshape(train_data.shape[0], 1, 1, -1).astype('float32')
+    return_train_target = (train_target.as_matrix() > 0.5).astype('float32')
+    return_train_e_exp = train_eexp.as_matrix().astype('float32')
+
+    return_val_data = validate_data.as_matrix().reshape(validate_data.shape[0], 1, 1, -1).astype('float32')
+    return_val_target = (validate_target.as_matrix() > 0.5).astype('float32')
+    return_val_e_exp = validate_eexp.as_matrix().astype('float32')
+
+    return return_train_data, \
+           return_train_target, \
+           return_train_e_exp, \
+           return_val_data, \
+           return_val_target, \
+           return_val_e_exp
+
+
 def get_bank_sales_data(path='./data/bank_sales_data/'):
     """
     Get insurance data.

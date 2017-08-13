@@ -1807,6 +1807,6 @@ class Trainer:
         fig_1.savefig('./log/val_samples_anomaly_detection.png')
 
         return train_ind_loss[train_ind_loss[:, 1] < threshold, 0].astype('int'), \
-               train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
-               val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
-               val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')
+            train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
+            val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
+            val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')

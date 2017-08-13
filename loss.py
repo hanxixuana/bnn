@@ -215,7 +215,7 @@ class BernoulliLoss(nn.Module):
         :type output_float_array:   np.ndarray
         :type target_float_array:   np.ndarray
         :type lift_at:              float or double
-        :type e_exp_float_array:      np.ndarray or None
+        :type e_exp_float_array:    np.ndarray or None
         :rtype:                     float
         """
 
