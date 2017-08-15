@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 from __future__ import print_function
 
+from copy import deepcopy
+from multiprocessing import Pool
+
 import numpy as np
 import pandas as pd
 import torch
@@ -85,11 +88,14 @@ def bernoulli_pct_obs_to_pct_of_response_sum(target, prediction, pct_of_sum):
     return pct_needed
 
 
-def bernoulli_lift_level(target, prediction, pct_of_sum):
+def bernoulli_lift_level(prediction, target, pct_of_sum, prob=False):
     sum_all_response = np.sum(target)
     total_count = float(target.shape[0])
 
-    sorted_indices_val_prediction = np.argsort(-1.0 / (1.0 + np.exp(-prediction)))
+    if not prob:
+        sorted_indices_val_prediction = np.argsort(-1.0 / (1.0 + np.exp(-prediction)))
+    else:
+        sorted_indices_val_prediction = np.argsort(-prediction)
 
     accumulated_sum = 0.0
     accumulated_count = 0.0
@@ -380,3 +386,61 @@ def get_two_number_from_mnist(two_numbers, path='./data/mnist/', validate_propor
     val_target[val_target == two_numbers[1]] = 1.0
 
     return train_data, train_target, val_data, val_target
+
+
+def generate_param_list(xgb_param_cand, nn_param_cand, train_param_cand, default_param):
+
+    n_xgb_cand = np.prod([xgb_param_cand[key].__len__() for key in xgb_param_cand if key != 'param_position'])
+    n_nn_cand = np.prod([nn_param_cand[key].__len__() for key in nn_param_cand if key != 'param_position'])
+    n_train_cand = np.prod([train_param_cand[key].__len__() for key in train_param_cand if key != 'param_position'])
+
+    xgb_list = [deepcopy(default_param[xgb_param_cand['param_position']]) for _ in range(n_xgb_cand)]
+    nn_list = [deepcopy(default_param[nn_param_cand['param_position']]) for _ in range(n_nn_cand)]
+    train_list = [deepcopy(default_param[train_param_cand['param_position']]) for _ in range(n_train_cand)]
+
+    # ==
+    for idx in range(n_xgb_cand):
+        temp_idx = idx
+        for param in xgb_param_cand:
+            if param != 'param_position':
+                xgb_list[idx][param] = xgb_param_cand[param][temp_idx % len(xgb_param_cand[param])]
+                temp_idx /= len(xgb_param_cand[param])
+
+    for idx in range(n_nn_cand):
+        temp_idx = idx
+        for param in nn_param_cand:
+            if param != 'param_position':
+                nn_list[idx][param] = nn_param_cand[param][temp_idx % len(nn_param_cand[param])]
+                temp_idx /= len(nn_param_cand[param])
+
+    for idx in range(n_train_cand):
+        temp_idx = idx
+        for param in train_param_cand:
+            if param != 'param_position':
+                train_list[idx][param] = train_param_cand[param][temp_idx % len(train_param_cand[param])]
+                temp_idx /= len(train_param_cand[param])
+
+    param_list = []
+    run_idx = 0
+    for xgb_param in xgb_list:
+        for nn_param in nn_list:
+            for train_param in train_list:
+                param_list.append((run_idx, deepcopy(xgb_param), deepcopy(nn_param), deepcopy(train_param)))
+                run_idx += 1
+
+    print('Generated %d sets of parameters.' % run_idx)
+
+    return param_list
+
+
+def param_optim(func_handle, param_list, n_process = 11):
+
+    pool = Pool(n_process)
+
+    pool.map(func_handle, param_list)
+
+
+
+
+
+

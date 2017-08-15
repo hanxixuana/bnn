@@ -463,7 +463,7 @@ class DataLoader:
             self.target = target
 
         if e_exp is None:
-            self.e_exp = np.ones_like(target, dtype='float32')
+            self.e_exp = np.ones([self.data.shape[0], 1], dtype='float32')
         else:
             if not isinstance(e_exp, np.ndarray):
                 raise ValueError('Error: e_exp is not numpy.ndarray.')
@@ -476,7 +476,7 @@ class DataLoader:
                 self.e_exp = e_exp.astype('float32')
 
         if weight is None:
-            self.weight = np.ones_like(target, dtype='float32')
+            self.weight = np.ones([self.data.shape[0], 1], dtype='float32')
         else:
             if not isinstance(weight, np.ndarray):
                 raise ValueError('Error: weight is not numpy.ndarray.')
@@ -712,17 +712,18 @@ class Trainer:
         sample_n = data.shape[0]
         result = np.array(
             [
-                float(
+                [
                     fun(
                         item[
                             ~np.isnan(item)
                         ]
                     )
-                )
+                ]
                 if np.sum(np.isnan(item)) < sample_n else 1.0
                 for item in data.reshape(data.shape[0], -1).transpose()
-                ]
+            ]
         )
+        result = result.astype('float32')
         if logger:
             range_string = 'feature ' + fun.__name__ + ': \n'
             for idx, item in enumerate(result):
@@ -750,11 +751,13 @@ class Trainer:
         if self.model.enable_cuda:
             target_float_variable = Variable(torch.from_numpy(target_float_array).cuda())
             e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array).cuda())
-            weight_float_variable = Variable(torch.from_numpy(weight_float_array).cuda())
+            sample_weight_float_variable = Variable(torch.from_numpy(weight_float_array).cuda())
+            feature_weight_float_variable = Variable(1.0 / self.std_per_feature_float_tensor.cuda())
         else:
             target_float_variable = Variable(torch.from_numpy(target_float_array))
             e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array))
-            weight_float_variable = Variable(torch.from_numpy(weight_float_array))
+            sample_weight_float_variable = Variable(torch.from_numpy(weight_float_array))
+            feature_weight_float_variable = Variable(1.0 / self.std_per_feature_float_tensor)
 
         if mode == 'loss_and_backward_and_update':
 
@@ -775,7 +778,8 @@ class Trainer:
                 output_float_variable,
                 target_float_variable,
                 e_exp_float_variable,
-                weight_float_variable,
+                sample_weight_float_variable,
+                feature_weight_float_variable,
                 corrected_target_float_variable,
             )
 
@@ -803,7 +807,8 @@ class Trainer:
                 output_float_variable,
                 target_float_variable,
                 e_exp_float_variable,
-                weight_float_variable,
+                sample_weight_float_variable,
+                feature_weight_float_variable,
                 corrected_target_float_variable
             )
 
@@ -825,7 +830,8 @@ class Trainer:
                 output_float_variable,
                 target_float_variable,
                 e_exp_float_variable,
-                weight_float_variable,
+                sample_weight_float_variable,
+                feature_weight_float_variable
             )
 
             if self.model.enable_cuda:
@@ -913,43 +919,28 @@ class Trainer:
                 * self.model.nn_loss.torch_link(output_float_variable, e_exp_float_variable)
             return corrected_target_float_variable
 
-    def _cal_loss(self, output_float_variable, target_float_variable, e_exp_float_variable, weight_float_variable,
+    def _cal_loss(self, output_float_variable, target_float_variable,
+                  e_exp_float_variable, sample_weight_float_variable, feature_weight_float_variable,
                   corrected_target_float_variable=None):
 
         loss_variable = None
 
-        if corrected_target_float_variable:
+        if corrected_target_float_variable is not None:
             loss_variable = self.model.nn_loss(
                 output_float_variable,
                 corrected_target_float_variable,
                 e_exp_float_variable,
-                weight_float_variable
+                sample_weight_float_variable,
+                feature_weight_float_variable
             )
 
         display_loss_variable = self.model.nn_loss(
             output_float_variable,
             target_float_variable,
             e_exp_float_variable,
-            weight_float_variable
+            sample_weight_float_variable,
+            feature_weight_float_variable
         )
-
-        # elif self.model.nn_loss.__class__.__name__ == 'FeatureNormalizedMSE':
-        #
-        #     if corrected_target_float_variable:
-        #         loss_variable = self.model.nn_loss(
-        #             output_float_variable.double(),
-        #             corrected_target_float_variable,
-        #             1.0 / self.std_per_feature_float_tensor
-        #         )
-        #
-        #     display_loss_variable = self.model.nn_loss(
-        #         output_float_variable,
-        #         target_float_variable,
-        #         1.0 / self.std_per_feature_float_tensor
-        #     )
-        #
-        # else:
-        #     raise NotImplementedError
 
         if corrected_target_float_variable:
             return loss_variable, display_loss_variable
@@ -1723,14 +1714,14 @@ class Trainer:
         train_loss = self.model.nn_loss.individual_loss(
             train_prediction_float_array,
             self.train_target,
-            1.0 / self.std_per_feature_float_tensor
+            1.0 / self.std_per_feature_float_tensor.numpy()
         )
 
         val_prediction_float_array = self.model.predict(self.val_data)
-        val_loss = self.model.nn_loss.individial_loss(
+        val_loss = self.model.nn_loss.individual_loss(
             val_prediction_float_array,
             self.val_target,
-            1.0 / self.std_per_feature_float_tensor
+            1.0 / self.std_per_feature_float_tensor.numpy()
         )
 
         train_ind_loss = np.concatenate(
@@ -1807,6 +1798,6 @@ class Trainer:
         fig_1.savefig('./log/val_samples_anomaly_detection.png')
 
         return train_ind_loss[train_ind_loss[:, 1] < threshold, 0].astype('int'), \
-            train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
-            val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
-            val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')
+               train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
+               val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
+               val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')

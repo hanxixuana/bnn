@@ -20,7 +20,8 @@ class PureXGB(nn.Module):
 
 
 class BoostFC(nn.Module):
-    def __init__(self, n_channel_to_nn, first_dim_to_nn, second_dim_to_nn, dim_of_hidden_layer, dropout_prob=0.5):
+    def __init__(self, n_channel_to_nn, first_dim_to_nn, second_dim_to_nn, dim_of_hidden_layer, dropout_prob=0.0):
+
         super(BoostFC, self).__init__()
 
         self.n_channel_from_boosting = n_channel_to_nn
@@ -43,6 +44,7 @@ class BoostFC(nn.Module):
         )
 
     def forward(self, x):
+
         x = x.view(-1,
                    self.n_channel_from_boosting *
                    self.first_dim_from_boosting *
@@ -180,46 +182,65 @@ class ResRegNet(nn.Module):
         return x
 
 
-class AutoEncoder(nn.Module):
-    def __init__(self, layer_size_list):
-        super(AutoEncoder, self).__init__()
-
-        encoder_layer_size_list = zip(layer_size_list[:-1], layer_size_list[1:])
-        decoder_layer_size_list = zip(layer_size_list[1:][::-1], layer_size_list[:-1][::-1])
-
-        self.encoder = nn.Sequential()
-        for idx, item in enumerate(encoder_layer_size_list):
-            self.encoder.add_module('linear_' + str(idx), nn.Linear(item[0], item[1]))
-            self.encoder.add_module('activation_' + str(idx), nn.Sigmoid())
-
-        self.decoder = nn.Sequential()
-        for idx, item in enumerate(decoder_layer_size_list):
-            self.decoder.add_module('linear_' + str(idx), nn.Linear(item[0], item[1]))
-            if idx < decoder_layer_size_list.__len__() - 1:
-                self.decoder.add_module('activation_' + str(idx), nn.Sigmoid())
-
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
-
-
-class OneLayerAE(nn.Module):
-    def __init__(self, input_size, hidden_size):
+class TwoLayerAE(nn.Module):
+    def __init__(self, input_size, hidden_size_0, hidden_size_1):
         super(OneLayerAE, self).__init__()
 
-        self.activation = nn.Sigmoid()
+        self.middle_layer = nn.Linear(hidden_size_0, hidden_size_1)
+        self.output_layer = nn.Linear(hidden_size_1, input_size)
 
-        self.output_layer = nn.Linear(hidden_size, input_size)
+        self.n_channel_to_boosting = 1
+        self.first_dim_to_boosting = 1
+        self.second_dim_to_boosting = input_size
 
         self.n_channel_from_boosting = 1
         self.first_dim_from_boosting = 1
-        self.second_dim_from_boosting = hidden_size
+        self.second_dim_from_boosting = hidden_size_0
 
     def forward(self, x):
+
         x = x.view(-1,
                    self.n_channel_from_boosting
                    * self.first_dim_from_boosting
                    * self.second_dim_from_boosting
                    )
+        x = F.elu(x)
+
+        x = self.middle_layer(x)
+        x = F.elu(x)
+
+        x = self.output_layer(x)
+        x = x.view(-1,
+                   self.n_channel_to_boosting,
+                   self.first_dim_to_boosting,
+                   self.second_dim_to_boosting
+                   )
+
+        return x
+
+class OneLayerAE(nn.Module):
+    def __init__(self, input_size, hidden_size_0):
+        super(OneLayerAE, self).__init__()
+
+        self.output_layer = nn.Linear(hidden_size_0, input_size)
+
+        self.n_channel_to_boosting = 1
+        self.first_dim_to_boosting = 1
+        self.second_dim_to_boosting = input_size
+
+        self.n_channel_from_boosting = 1
+        self.first_dim_from_boosting = 1
+        self.second_dim_from_boosting = hidden_size_0
+
+    def forward(self, x):
+
+        x = x.view(-1,
+                   self.n_channel_from_boosting
+                   * self.first_dim_from_boosting
+                   * self.second_dim_from_boosting
+                   )
+        x = F.elu(x)
+
         x = self.output_layer(x)
         x = x.view(-1,
                    self.n_channel_to_boosting,
