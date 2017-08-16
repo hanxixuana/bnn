@@ -394,31 +394,38 @@ def generate_param_list(xgb_param_cand, nn_param_cand, train_param_cand, default
     n_nn_cand = np.prod([nn_param_cand[key].__len__() for key in nn_param_cand if key != 'param_position'])
     n_train_cand = np.prod([train_param_cand[key].__len__() for key in train_param_cand if key != 'param_position'])
 
-    xgb_list = [deepcopy(default_param[xgb_param_cand['param_position']]) for _ in range(n_xgb_cand)]
-    nn_list = [deepcopy(default_param[nn_param_cand['param_position']]) for _ in range(n_nn_cand)]
-    train_list = [deepcopy(default_param[train_param_cand['param_position']]) for _ in range(n_train_cand)]
+    if isinstance(n_xgb_cand, np.float64):
+        xgb_list = [deepcopy(default_param[xgb_param_cand['param_position']])]
+    else:
+        xgb_list = [deepcopy(default_param[xgb_param_cand['param_position']]) for _ in range(n_xgb_cand)]
+        for idx in range(n_xgb_cand):
+            temp_idx = idx
+            for param in xgb_param_cand:
+                if param != 'param_position':
+                    xgb_list[idx][param] = xgb_param_cand[param][temp_idx % len(xgb_param_cand[param])]
+                    temp_idx /= len(xgb_param_cand[param])
 
-    # ==
-    for idx in range(n_xgb_cand):
-        temp_idx = idx
-        for param in xgb_param_cand:
-            if param != 'param_position':
-                xgb_list[idx][param] = xgb_param_cand[param][temp_idx % len(xgb_param_cand[param])]
-                temp_idx /= len(xgb_param_cand[param])
+    if isinstance(n_nn_cand, np.float64):
+        nn_list = [deepcopy(default_param[nn_param_cand['param_position']])]
+    else:
+        nn_list = [deepcopy(default_param[nn_param_cand['param_position']]) for _ in range(n_nn_cand)]
+        for idx in range(n_nn_cand):
+            temp_idx = idx
+            for param in nn_param_cand:
+                if param != 'param_position':
+                    nn_list[idx][param] = nn_param_cand[param][temp_idx % len(nn_param_cand[param])]
+                    temp_idx /= len(nn_param_cand[param])
 
-    for idx in range(n_nn_cand):
-        temp_idx = idx
-        for param in nn_param_cand:
-            if param != 'param_position':
-                nn_list[idx][param] = nn_param_cand[param][temp_idx % len(nn_param_cand[param])]
-                temp_idx /= len(nn_param_cand[param])
-
-    for idx in range(n_train_cand):
-        temp_idx = idx
-        for param in train_param_cand:
-            if param != 'param_position':
-                train_list[idx][param] = train_param_cand[param][temp_idx % len(train_param_cand[param])]
-                temp_idx /= len(train_param_cand[param])
+    if isinstance(n_train_cand, np.float64):
+        train_list = [deepcopy(default_param[train_param_cand['param_position']])]
+    else:
+        train_list = [deepcopy(default_param[train_param_cand['param_position']]) for _ in range(n_train_cand)]
+        for idx in range(n_train_cand):
+            temp_idx = idx
+            for param in train_param_cand:
+                if param != 'param_position':
+                    train_list[idx][param] = train_param_cand[param][temp_idx % len(train_param_cand[param])]
+                    temp_idx /= len(train_param_cand[param])
 
     param_list = []
     run_idx = 0
