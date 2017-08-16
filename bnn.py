@@ -569,16 +569,23 @@ class Trainer:
         self.logger.log('__init__ starts...', 'Trainer.__init__()')
         self.logger.log('NN Name: ' + model.nn_model.__class__.__name__, 'Trainer.__init__()')
         self.logger.log('NN Structure: \n' + model.nn_model.__repr__(), 'Trainer.__init__()')
-        self.logger.log('================= Training param =================',
-                        'Trainer.__init__()')
-        for key in train_param:
-            self.logger.log(key + ': ' + str(train_param[key]), 'Trainer.__init__()')
-        self.logger.log('================= XGBoost param ==================',
+
+        self.logger.log('================= XGBoost Parameters ==================',
                         'Trainer.__init__()')
         for key in model.xgb_param:
             self.logger.log(key + ': ' + str(model.xgb_param[key] if key is not None else ' '), 'Trainer.__init__()')
         self.logger.log('===================================================',
                         'Trainer.__init__()')
+
+        self.logger.log('================= Neural Networks Parameters =================',
+                        'Trainer.__init__()')
+        for key in model.nn_param:
+            self.logger.log(key + ': ' + str(model.nn_param[key]), 'Trainer.__init__()')
+
+        self.logger.log('================= Training Parameters =================',
+                        'Trainer.__init__()')
+        for key in train_param:
+            self.logger.log(key + ': ' + str(train_param[key]), 'Trainer.__init__()')
 
         torch.set_num_threads(train_param['torch_nthread'])
 
