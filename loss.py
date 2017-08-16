@@ -263,12 +263,10 @@ class BernoulliLoss(nn.Module):
         else:
             e_exp_float_vec = e_exp_float_array[:, 0]
 
-        output_after_link_float_vec = self.np_link(output_float_vec, e_exp_float_vec)
-
         required_exposure = lift_at * np.sum(e_exp_float_vec)
         total_positive = np.sum(target_float_vec)
 
-        sorted_indices_val_prediction = np.argsort(-output_after_link_float_vec)
+        sorted_indices_val_prediction = np.argsort(-output_float_vec)
 
         accumulated_exposure = 0.0
         accumulated_positive = 0.0
