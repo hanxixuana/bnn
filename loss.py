@@ -148,6 +148,9 @@ class FeatureNormalizedMSE(nn.Module):
 
 
 class BernoulliLoss(nn.Module):
+
+    numerical_stability_constant = 1e-8
+
     def __init__(self):
         super(BernoulliLoss, self).__init__()
 
@@ -174,9 +177,9 @@ class BernoulliLoss(nn.Module):
             sample_weight_float_variable
             *
             (
-                (1.0 - target_float_variable) * torch.log(1.0 - output_after_link_float_variable)
+                (1.0 - target_float_variable) * torch.log(1.0 + self.numerical_stability_constant - output_after_link_float_variable)
                 +
-                target_float_variable * torch.log(output_after_link_float_variable)
+                target_float_variable * torch.log(self.numerical_stability_constant + output_after_link_float_variable)
             )
         )
 
