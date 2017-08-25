@@ -12,12 +12,14 @@ import torch
 import torch.optim as optim
 import xgboost as xgb
 from torch.autograd import Variable
-from tqdm import trange
 
 from log_to_file import Logger
 
 
 class BoostNN:
+
+    abs_ave_grad_and_hess_floor = 1e-45
+
     def __init__(self, **kwargs):
         """
         Connect a neural network with a XGBoost.
@@ -31,7 +33,7 @@ class BoostNN:
         :param nn_optimizer:        an initialized optimizer of nn
         :param loss:                an initialized loss of nn
         :param feature_dim_list:    a list of [n_channel_to_boosting, first_dim_to_boosting, second_dim_to_boosting]
-        :param xgb_param:          a dictionary of parameters for XGB
+        :param xgb_param:           a dictionary of parameters for XGB
         :param enable_cuda:         a boolean value
 
         """
@@ -105,7 +107,6 @@ class BoostNN:
             self.first_dim_to_boosting * \
             self.second_dim_to_boosting
         xgb_param['objective'] = 'reg:linear'
-        xgb_param['max_delta_step'] = 0.0
 
         if self.enable_cuda:
             xgb_param['updater'] = 'grow_gpu'
@@ -160,10 +161,13 @@ class BoostNN:
                 ] for _ in range(self.n_channel_from_boosting)
             ]
 
-    def _add_booster_layer(self, channel_idx, first_dim_idx, second_dim_idx):
+    def _add_booster_layer(self, channel_idx, first_dim_idx, second_dim_idx, lr=None):
 
         self.xgb_param['seed'] = \
             self.booster_layer_seed_list[channel_idx][first_dim_idx][second_dim_idx]
+
+        if lr is not None:
+            self.xgb_param['learning_rate'] = lr
 
         self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx].append(
             xgb.Booster(params=self.xgb_param)
@@ -173,40 +177,135 @@ class BoostNN:
 
         self.newly_updated_booster_layer_list[channel_idx][first_dim_idx][second_dim_idx] = True
 
-    def train_booster_layer(self, dmatrix, grad, hess):
+    def train_booster_layer(self, dmatrix, grad, hess, lr=None):
         """
         Train a booster layer.
 
-        :type dmatrix:  xgboost.core.DMatrix
-        :type grad:     numpy.ndarray
-        :type hess:     numpy.ndarray
+        :type dmatrix:  xgb.core.DMatrix
+        :type grad:     torch.FloatTensor
+        :type hess:     torch.FloatTensor
+        :type lr:       float or double
 
-        :param dmatrix: a dmatrix of
-                        [
+        :param dmatrix: [
                             batch_size * add_booster_layer_after_n_batch,
                             n_channel_to_boosting * first_dim_to_boosting * second_dim_to_boosting
                         ]
-        :param grad:    a numpy array of
-                        [
+                        on host
+        :param grad:    [
                             batch_size * add_booster_layer_after_n_batch,
                             n_channel_from_boosting,
                             first_dim_from_boosting,
                             second_dim_from_boosting
                         ]
-        :param hess:    a numpy array of
-                        [
+                        on host
+        :param hess:    [
                             batch_size * add_booster_layer_after_n_batch,
                             n_channel_from_boosting,
                             first_dim_from_boosting,
                             second_dim_from_boosting
                         ]
+                        on host
+        :param lr:      use learning_rate in xgb_param if not provided
         """
+
+        n_rows = dmatrix.num_row()
+
         dmatrix.set_base_margin(
             np.zeros(
-                dmatrix.num_row(),
+                n_rows,
                 dtype='float32'
             )
         )
+
+        for channel_idx in range(self.n_channel_from_boosting):
+            for first_dim_idx in range(self.first_dim_from_boosting):
+                for second_dim_idx in range(self.second_dim_from_boosting):
+
+                    abs_ave_of_grad = torch.mean(
+                        torch.abs(
+                            grad[:, channel_idx, first_dim_idx, second_dim_idx]
+                        )
+                    )
+
+                    if abs_ave_of_grad > self.abs_ave_grad_and_hess_floor:
+
+                        train_grad = grad[:, channel_idx, first_dim_idx, second_dim_idx] / abs_ave_of_grad
+
+                        self._add_booster_layer(
+                            channel_idx,
+                            first_dim_idx,
+                            second_dim_idx,
+                            lr
+                        )
+
+                        abs_ave_of_hess = torch.mean(
+                            torch.abs(
+                                hess[:, channel_idx, first_dim_idx, second_dim_idx]
+                            )
+                        )
+
+                        if abs_ave_of_hess < self.abs_ave_grad_and_hess_floor:
+                            train_hess = torch.ones(n_rows)
+                            self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
+                                abs_ave_of_grad
+                            )
+                        else:
+                            train_hess = hess[:, channel_idx, first_dim_idx, second_dim_idx] / abs_ave_of_hess
+                            self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
+                                abs_ave_of_grad / abs_ave_of_hess
+                            )
+
+                        self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
+                            dmatrix,
+                            train_grad.numpy().tolist(),
+                            train_hess.numpy().tolist()
+                        )
+
+        return np.sum(self.newly_updated_booster_layer_list)
+
+    def new_train_booster_layer(self, dmatrix, grad, hess, lr=None):
+        """
+        Train a booster layer.
+
+        :type dmatrix:  xgb.core.DMatrix
+        :type grad:     torch.FloatTensor
+        :type hess:     torch.FloatTensor
+        :type lr:       float or double
+
+        :param dmatrix: [
+                            batch_size * add_booster_layer_after_n_batch,
+                            n_channel_to_boosting * first_dim_to_boosting * second_dim_to_boosting
+                        ]
+                        on host
+        :param grad:    [
+                            batch_size * add_booster_layer_after_n_batch,
+                            n_channel_from_boosting,
+                            first_dim_from_boosting,
+                            second_dim_from_boosting
+                        ]
+                        on host
+        :param hess:    [
+                            batch_size * add_booster_layer_after_n_batch,
+                            n_channel_from_boosting,
+                            first_dim_from_boosting,
+                            second_dim_from_boosting
+                        ]
+                        on host
+        :param lr:      use learning_rate in xgb_param if not provided
+        """
+
+        n_rows = dmatrix.num_row()
+
+        dmatrix.set_base_margin(
+            np.zeros(
+                n_rows,
+                dtype='float32'
+            )
+        )
+
+        grad = grad.numpy()
+        hess = hess.numpy()
+
         for channel_idx in range(self.n_channel_from_boosting):
             for first_dim_idx in range(self.first_dim_from_boosting):
                 for second_dim_idx in range(self.second_dim_from_boosting):
@@ -217,9 +316,14 @@ class BoostNN:
                         )
                     )
 
-                    if abs_ave_of_grad > 0.0:
-                        # add a booster layer
-                        self._add_booster_layer(channel_idx, first_dim_idx, second_dim_idx)
+                    if abs_ave_of_grad > self.abs_ave_grad_and_hess_floor:
+
+                        self._add_booster_layer(
+                            channel_idx,
+                            first_dim_idx,
+                            second_dim_idx,
+                            lr
+                        )
 
                         scaling_coef = \
                             abs_ave_of_grad \
@@ -242,9 +346,11 @@ class BoostNN:
 
                         self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
                             dmatrix,
-                            train_grad.astype('float32').tolist(),
-                            train_hess.astype('float32').tolist()
+                            train_grad.tolist(),
+                            train_hess.tolist()
                         )
+
+        return np.sum(self.newly_updated_booster_layer_list)
 
     def _grad_hook(self):
         def hook(grad):
@@ -255,22 +361,16 @@ class BoostNN:
     def nn_forward(self, x, requires_grad=True):
         """
         Forward the net.
-        :param x:               a numpy array of
-                                [
-                                    batch_size,
-                                    n_channel_from_boosting,
-                                    first_dim_from_boosting,
-                                    second_dim_from_boosting
-                                ]
-        :param requires_grad:   requires gradient or not
-        :return: a Variable
+        :param torch.FloatTensor x: [
+                                        batch_size,
+                                        n_channel_from_boosting,
+                                        first_dim_from_boosting,
+                                        second_dim_from_boosting
+                                    ]
+        :param bool requires_grad:  requires gradient or not
+        :return Variable:           nn output
         """
-        if self.enable_cuda:
-            self.input_to_nn_model = \
-                Variable(torch.from_numpy(x).cuda().contiguous(), requires_grad=requires_grad)
-        else:
-            self.input_to_nn_model = \
-                Variable(torch.from_numpy(x), requires_grad=requires_grad)
+        self.input_to_nn_model = Variable(x.contiguous(), requires_grad=requires_grad)
 
         if requires_grad:
             self.input_to_nn_model.register_hook(self._grad_hook())
@@ -282,36 +382,42 @@ class BoostNN:
     def predict(self, x):
         """
         Predict.
-        :param x:   a numpy array of
-                    [
-                        batch_size,
-                        n_channel_to_boosting,
-                        first_dim_to_boosting,
-                        second_dim_to_boosting
-                    ]
-        :return: a numpy array of the shape of the output of the network
+        :param np.array x:  [
+                                batch_size,
+                                n_channel_to_boosting,
+                                first_dim_to_boosting,
+                                second_dim_to_boosting
+                            ]
+        :return np.array:   nn output
         """
-        dmatrix = xgb.DMatrix(x.reshape(x.shape[0], -1))
+
+        n_rows = x.shape[0]
+
+        dmatrix = xgb.DMatrix(
+            x.reshape(
+                n_rows,
+                -1
+            )
+        )
         dmatrix.set_base_margin(
             np.zeros(
-                dmatrix.num_row(),
+                n_rows,
                 dtype='float32'
             )
         )
 
-        xgb_predictions = np.zeros(
+        xgb_predictions = torch.zeros(
             [
-                dmatrix.num_row(),
+                n_rows,
                 self.n_channel_from_boosting,
                 self.first_dim_from_boosting,
                 self.second_dim_from_boosting
             ],
-            dtype='float32'
         )
 
         for channel_idx in range(self.n_channel_from_boosting):
             for first_dim_idx in range(self.first_dim_from_boosting):
-                for second_dim_idx in trange(self.second_dim_from_boosting):
+                for second_dim_idx in range(self.second_dim_from_boosting):
                     xgb_predictions[:, channel_idx, first_dim_idx, second_dim_idx] = \
                         self._booster_predict(
                             dmatrix,
@@ -322,26 +428,35 @@ class BoostNN:
 
         predictions = self.nn_forward(xgb_predictions, requires_grad=False)
 
-        if self.enable_cuda:
-            return predictions.data.cpu().numpy()
-        else:
-            return predictions.data.numpy()
+        return predictions.data.numpy()
 
     def _booster_predict(self, dmatrix, channel_idx, first_dim_idx, second_dim_idx):
 
-        predictions = np.zeros(dmatrix.num_row(), dtype='float32')
+        predictions = torch.zeros(dmatrix.num_row())
 
         for booster_layer_idx in range(self.booster_layer_count_list[channel_idx][first_dim_idx][second_dim_idx]):
-            predictions += \
-                self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][booster_layer_idx] \
-                    .predict(dmatrix) \
-                * self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx][booster_layer_idx]
+            predictions += (
+                torch.from_numpy(
+                    self.booster_layer_list
+                    [channel_idx]
+                    [first_dim_idx]
+                    [second_dim_idx]
+                    [booster_layer_idx].predict(dmatrix)
+                )
+                *
+                self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx][booster_layer_idx]
+            )
 
         return predictions
 
     def predict_with_newly_added_booster(self, dmatrix, reset_newly_updated_booster_layer_list):
+        """
+        :type dmatrix:                                  xgb.core.DMatrix
+        :type reset_newly_updated_booster_layer_list:   bool
+        :rtype:                                         torch.FloatTensor
+        """
 
-        predictions = np.zeros(
+        predictions = torch.zeros(
             [
                 dmatrix.num_row(),
                 self.n_channel_from_boosting,
@@ -363,12 +478,15 @@ class BoostNN:
 
                     if self.newly_updated_booster_layer_list[channel_idx][first_dim_idx][second_dim_idx]:
 
-                        predictions[:, channel_idx, first_dim_idx, second_dim_idx] = \
-                            self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1] \
-                                .predict(dmatrix)
-
-                        predictions[:, channel_idx, first_dim_idx, second_dim_idx] *= \
+                        predictions[:, channel_idx, first_dim_idx, second_dim_idx] = (
+                            torch.from_numpy(
+                                self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1]
+                                    .predict(dmatrix)
+                            )
+                            *
                             self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx][-1]
+                        )
+
                         if reset_newly_updated_booster_layer_list:
                             self.newly_updated_booster_layer_list[channel_idx][first_dim_idx][second_dim_idx] = False
 
@@ -493,9 +611,8 @@ class DataLoader:
         self.original_sample_n = data.shape[0]
         self.original_sample_index_list = range(self.original_sample_n)
 
-        self.total_batch_n = data.shape[0] / self.batch_size
+        self.total_batch_n = self.original_sample_n / self.batch_size
         self.total_sample_n = self.total_batch_n * self.batch_size
-
         self.total_sample_index_list = self._reset_total_sample_index_list(shuffle=False)
 
         self.current_batch_idx = -1
@@ -503,14 +620,14 @@ class DataLoader:
 
         self.used_sample_index_list = []
 
-        self.margin = np.zeros([self.data.shape[0]] + nn_input_shape).astype('float32')
+        self.margin = np.zeros([self.original_sample_n] + nn_input_shape, dtype='float32')
 
     def update_margin(self, margin_update):
         """
         Update the margin.
-        :param margin_update:   a numpy array of [self.data.shape[0], nn_input_shape]
+        :param torch.FloatTensor margin_update:   [self.data.shape[0]] + nn_input_shape
         """
-        self.margin += margin_update
+        self.margin += margin_update.cpu().numpy()
 
     def next_batch(self):
         """
@@ -529,18 +646,31 @@ class DataLoader:
             self.sample_idx_in_current_batch_list = []
             return False
 
-    def get_data_for_nn(self):
-        return self.margin[self.sample_idx_in_current_batch_list], \
-               self.target[self.sample_idx_in_current_batch_list], \
-               self.e_exp[self.sample_idx_in_current_batch_list], \
-               self.weight[self.sample_idx_in_current_batch_list],
+    def get_data_for_nn(self, enable_cuda):
+        if enable_cuda:
+            return torch.from_numpy(self.margin[self.sample_idx_in_current_batch_list]).cuda(), \
+                   torch.from_numpy(self.target[self.sample_idx_in_current_batch_list]).cuda(), \
+                   torch.from_numpy(self.e_exp[self.sample_idx_in_current_batch_list]).cuda(), \
+                   torch.from_numpy(self.weight[self.sample_idx_in_current_batch_list]).cuda(),
+        else:
+            return torch.from_numpy(self.margin[self.sample_idx_in_current_batch_list]), \
+                   torch.from_numpy(self.target[self.sample_idx_in_current_batch_list]), \
+                   torch.from_numpy(self.e_exp[self.sample_idx_in_current_batch_list]), \
+                   torch.from_numpy(self.weight[self.sample_idx_in_current_batch_list]),
 
-    def get_data_for_booster_layer(self):
-        return self.data[self.used_sample_index_list], \
-               self.margin[self.used_sample_index_list], \
-               self.target[self.used_sample_index_list], \
-               self.e_exp[self.used_sample_index_list], \
-               self.weight[self.used_sample_index_list]
+    def get_data_for_booster_layer(self, enable_cuda):
+        if enable_cuda:
+            return torch.from_numpy(self.data[self.used_sample_index_list]).cuda(), \
+                   torch.from_numpy(self.margin[self.used_sample_index_list]).cuda(), \
+                   torch.from_numpy(self.target[self.used_sample_index_list]).cuda(), \
+                   torch.from_numpy(self.e_exp[self.used_sample_index_list]).cuda(), \
+                   torch.from_numpy(self.weight[self.used_sample_index_list]).cuda()
+        else:
+            return torch.from_numpy(self.data[self.used_sample_index_list]), \
+                   torch.from_numpy(self.margin[self.used_sample_index_list]), \
+                   torch.from_numpy(self.target[self.used_sample_index_list]), \
+                   torch.from_numpy(self.e_exp[self.used_sample_index_list]), \
+                   torch.from_numpy(self.weight[self.used_sample_index_list])
 
     def get_length_of_data_for_booster_layer(self):
         return self.used_sample_index_list.__len__()
@@ -565,27 +695,65 @@ class Trainer:
     def __init__(self, model, train_param):
 
         # initialize a logger
-        self.logger = Logger('main', to_stdout=train_param['verbose'], path='log')
-        self.logger.log('__init__ starts...', 'Trainer.__init__()')
-        self.logger.log('NN Name: ' + model.nn_model.__class__.__name__, 'Trainer.__init__()')
-        self.logger.log('NN Structure: \n' + model.nn_model.__repr__(), 'Trainer.__init__()')
+        self.logger = Logger(
+            'main',
+            to_stdout=train_param['verbose'],
+            path=train_param['log_path']
+        )
+        self.logger.log(
+            'Initialization Starts...',
+            'Trainer.__init__()'
+        )
+        self.logger.log(
+            'NN Name: ' + model.nn_model.__class__.__name__,
+            'Trainer.__init__()'
+        )
+        self.logger.log(
+            'NN Structure: \n' + model.nn_model.__repr__(),
+            'Trainer.__init__()'
+        )
 
-        self.logger.log('================= XGBoost Parameters ==================',
-                        'Trainer.__init__()')
+        self.logger.log(
+            '================= XGBoost Parameters ==============',
+            'Trainer.__init__()'
+        )
         for key in model.xgb_param:
-            self.logger.log(key + ': ' + str(model.xgb_param[key] if key is not None else ' '), 'Trainer.__init__()')
-        self.logger.log('===================================================',
-                        'Trainer.__init__()')
+            self.logger.log(
+                key + ': ' + str(model.xgb_param[key] if key is not None else ' '),
+                'Trainer.__init__()'
+            )
+        self.logger.log(
+            '===================================================',
+            'Trainer.__init__()'
+        )
 
-        self.logger.log('================= Neural Networks Parameters =================',
-                        'Trainer.__init__()')
+        self.logger.log(
+            '============ Neural Networks Parameters ===========',
+            'Trainer.__init__()'
+        )
         for key in model.nn_param:
-            self.logger.log(key + ': ' + str(model.nn_param[key]), 'Trainer.__init__()')
+            self.logger.log(
+                key + ': ' + str(model.nn_param[key]),
+                'Trainer.__init__()'
+            )
+        self.logger.log(
+            '===================================================',
+            'Trainer.__init__()'
+        )
 
-        self.logger.log('================= Training Parameters =================',
-                        'Trainer.__init__()')
+        self.logger.log(
+            '=============== Training Parameters ===============',
+            'Trainer.__init__()'
+        )
         for key in train_param:
-            self.logger.log(key + ': ' + str(train_param[key]), 'Trainer.__init__()')
+            self.logger.log(
+                key + ': ' + str(train_param[key]),
+                'Trainer.__init__()'
+            )
+        self.logger.log(
+            '===================================================',
+            'Trainer.__init__()'
+        )
 
         torch.set_num_threads(train_param['torch_nthread'])
 
@@ -602,8 +770,6 @@ class Trainer:
 
         # some float tensors
         self.std_per_feature_float_tensor = None
-        self.max_per_feature_float_tensor = None
-        self.min_per_feature_float_tensor = None
 
         # for data
         self.train_data = None
@@ -620,8 +786,8 @@ class Trainer:
         self.val_set_loader = None
 
         # for adam
-        self.ma_grad_array = None
-        self.ma_hess_array = None
+        self.ma_grad_float_tensor = None
+        self.ma_hess_float_tensor = None
         self.count_of_booster_layer_training = 0
 
         # for recording
@@ -635,7 +801,10 @@ class Trainer:
 
         self.count_of_warming_and_training = -1
 
-        self.logger.log('__init__ ends...\n', 'Trainer.__init__()')
+        self.logger.log(
+            'Initialization Ends...\n',
+            'Trainer.__init__()'
+        )
 
     @staticmethod
     def _start_string(phase, output_0, output_1, output_2, output_3, output_4):
@@ -668,51 +837,50 @@ class Trainer:
             self.val_e_exp = val_e_exp
             self.val_weight = val_weight
 
-        if self.train_param['normalize_to_0_1']:
-            self.train_data -= self.train_data[~np.isnan(self.train_data)].min()
-            self.train_data /= self.train_data[~np.isnan(self.train_data)].max()
-            self.val_data -= self.val_data[~np.isnan(self.val_data)].min()
-            self.val_data /= self.val_data[~np.isnan(self.val_data)].max()
-
         self.logger.log(
             'train_data max: ' + str(self.train_data[~np.isnan(self.train_data)].max()) +
             '\t\ttrain_data min:  ' + str(self.train_data[~np.isnan(self.train_data)].min()) +
             '\t\tval_data max:  ' + str(self.val_data[~np.isnan(self.val_data)].max()) +
             '\t\tval_data min:  ' + str(self.val_data[~np.isnan(self.val_data)].min()),
-            'Trainer.__init__()'
+            'Trainer.input_data()'
         )
 
-        self.std_per_feature_float_tensor = self._per_feature_operation(self.train_data, np.std, self.logger)
-        self.max_per_feature_float_tensor = self._per_feature_operation(self.train_data, np.max, self.logger)
-        self.min_per_feature_float_tensor = self._per_feature_operation(self.train_data, np.min, self.logger)
+        self.std_per_feature_float_tensor = self._per_feature_operation(
+            self.train_data,
+            np.std,
+            self.logger
+        )
 
         # put data into a DataLoader
         self.train_set_loader = DataLoader(
-            train_data,
-            train_target,
+            self.train_data,
+            self.train_target,
             self.train_param['batch_size'],
             [
                 self.model.n_channel_from_boosting,
                 self.model.first_dim_from_boosting,
                 self.model.second_dim_from_boosting
             ],
-            e_exp=train_e_exp,
-            weight=train_weight
+            e_exp=self.train_e_exp,
+            weight=self.train_weight
         )
 
         self.val_set_loader = DataLoader(
-            val_data,
-            val_target,
-            val_data.shape[0],
+            self.val_data,
+            self.val_target,
+            self.val_data.shape[0],
             [
                 self.model.n_channel_from_boosting,
                 self.model.first_dim_from_boosting,
                 self.model.second_dim_from_boosting
             ],
-            e_exp=val_e_exp,
-            weight=val_weight
+            e_exp=self.val_e_exp,
+            weight=self.val_weight
         )
-        self.logger.log('train_set_loader and val_set_loader DONE.\n', 'Trainer.input_data()')
+        self.logger.log(
+            'train_set_loader and val_set_loader DONE.\n',
+            'Trainer.input_data()'
+        )
 
     @staticmethod
     def _per_feature_operation(data, fun, logger=None):
@@ -737,41 +905,49 @@ class Trainer:
                 range_string += ' ' * 10 + 'f_' + str(idx) + ': %.4f\t' % item
                 if idx % 5 == 4:
                     range_string += '\n'
-            logger.log(range_string, 'Trainer._per_feature_operation()')
+            # logger.log(range_string, 'Trainer._per_feature_operation()')
         return torch.from_numpy(result)
 
-    def _update_ma(self, grad_long_double_array, hess_long_double_array):
+    def _update_ma(self, grad_float_tensor, hess_float_tensor):
+        """
+        Update ADAM.
+        :param torch.FloatTensor grad_float_tensor: gradients
+        :param torch.FloatTensor hess_float_tensor: Hessian
+        """
 
-        if self.ma_grad_array is None or self.ma_hess_array is None:
-            self.ma_grad_array = (1.0 - self.grad_ma_coef) * grad_long_double_array
-            self.ma_hess_array = (1.0 - self.hess_ma_coef) * hess_long_double_array
+        if self.ma_grad_float_tensor is None or self.ma_hess_float_tensor is None:
+            self.ma_grad_float_tensor = (1.0 - self.grad_ma_coef) * grad_float_tensor
+            self.ma_hess_float_tensor = (1.0 - self.hess_ma_coef) * hess_float_tensor
         else:
-            self.ma_grad_array = \
-                self.grad_ma_coef * self.ma_grad_array \
-                + (1.0 - self.grad_ma_coef) * grad_long_double_array
-            self.ma_hess_array = \
-                self.hess_ma_coef * self.ma_hess_array \
-                + (1.0 - self.hess_ma_coef) * hess_long_double_array
+            self.ma_grad_float_tensor = (
+                self.grad_ma_coef * self.ma_grad_float_tensor
+                +
+                (1.0 - self.grad_ma_coef) * grad_float_tensor
+            )
+            self.ma_hess_float_tensor = (
+                self.hess_ma_coef * self.ma_hess_float_tensor
+                + (1.0 - self.hess_ma_coef) * hess_float_tensor
+            )
 
-    def _nn_step(self, margin_float_array, target_float_array, e_exp_float_array, weight_float_array, mode):
+    def _nn_step(self, margin_float_tensor, target_float_tensor, e_exp_float_tensor, sample_weight_float_tensor, mode):
+        """
+        :type margin_float_tensor: torch.FloatTensor
+        :type target_float_tensor: torch.FloatTensor
+        :type e_exp_float_tensor: torch.FloatTensor
+        :type sample_weight_float_tensor: torch.FloatTensor
+        """
 
-        if self.model.enable_cuda:
-            target_float_variable = Variable(torch.from_numpy(target_float_array).cuda())
-            e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array).cuda())
-            sample_weight_float_variable = Variable(torch.from_numpy(weight_float_array).cuda())
-            feature_weight_float_variable = Variable(1.0 / self.std_per_feature_float_tensor.cuda())
-        else:
-            target_float_variable = Variable(torch.from_numpy(target_float_array))
-            e_exp_float_variable = Variable(torch.from_numpy(e_exp_float_array))
-            sample_weight_float_variable = Variable(torch.from_numpy(weight_float_array))
-            feature_weight_float_variable = Variable(1.0 / self.std_per_feature_float_tensor)
+        target_float_variable = Variable(target_float_tensor)
+        e_exp_float_variable = Variable(e_exp_float_tensor)
+        sample_weight_float_variable = Variable(sample_weight_float_tensor)
+        feature_weight_float_variable = Variable(1.0 / self.std_per_feature_float_tensor)
 
         if mode == 'loss_and_backward_and_update':
 
             self.model.nn_optimizer.zero_grad()
 
             output_float_variable = self.model.nn_forward(
-                margin_float_array,
+                margin_float_tensor,
                 requires_grad=True
             )
 
@@ -791,6 +967,7 @@ class Trainer:
             )
 
             loss_variable.backward()
+
             self.model.nn_optimizer.step()
 
             return loss_variable.data[0], display_loss_variable.data[0]
@@ -800,7 +977,7 @@ class Trainer:
             self.model.nn_optimizer.zero_grad()
 
             output_float_variable = self.model.nn_forward(
-                margin_float_array,
+                margin_float_tensor,
                 requires_grad=True
             )
 
@@ -823,13 +1000,13 @@ class Trainer:
 
             return loss_variable.data[0], \
                 display_loss_variable.data[0], \
-                output_float_variable, \
-                corrected_target_float_variable
+                output_float_variable.data, \
+                corrected_target_float_variable.data
 
         elif mode == 'loss':
 
             output_float_variable = self.model.nn_forward(
-                margin_float_array,
+                margin_float_tensor,
                 requires_grad=False
             )
 
@@ -841,94 +1018,120 @@ class Trainer:
                 feature_weight_float_variable
             )
 
-            if self.model.enable_cuda:
-                return display_loss_variable.data[0], output_float_variable.data.cpu().numpy()
-            else:
-                return display_loss_variable.data[0], output_float_variable.data.numpy()
+            return display_loss_variable.data[0], output_float_variable.data
 
-    def _xgb_step(self, dmatrix, grad_long_double_array, hess_long_double_array):
+    def _xgb_step(self, data_float_tensor, grad_float_tensor, hess_float_tensor, lr=None):
         """
         Add a booster layer for those non-zero gradients.
-        :param dmatrix:                 a dmatrix of
-                                        [
-                                            batch_size * add_booster_layer_after_n_batch,
-                                            n_channel_to_boosting * first_dim_to_boosting * second_dim_to_boosting
-                                        ]
-        :param grad_long_double_array:  a numpy array of
-                                        [
-                                            batch_size * add_booster_layer_after_n_batch,
-                                            n_channel_from_boosting,
-                                            first_dim_from_boosting,
-                                            second_dim_from_boosting
-                                        ]
-        :param hess_long_double_array:    a numpy array of
-                                        [
-                                            batch_size * add_booster_layer_after_n_batch,
-                                            n_channel_from_boosting,
-                                            first_dim_from_boosting,
-                                            second_dim_from_boosting
-                                        ]
+        :param torch.FloatTensor data_float_tensor: [
+                                                        batch_size * add_booster_layer_after_n_batch,
+                                                        n_channel_to_boosting
+                                                        * first_dim_to_boosting
+                                                        * second_dim_to_boosting
+                                                    ]
+        :param torch.FloatTensor grad_float_tensor: [
+                                                        batch_size * add_booster_layer_after_n_batch,
+                                                        n_channel_from_boosting,
+                                                        first_dim_from_boosting,
+                                                        second_dim_from_boosting
+                                                    ]
+        :param torch.FloatTensor hess_float_tensor: [
+                                                        batch_size * add_booster_layer_after_n_batch,
+                                                        n_channel_from_boosting,
+                                                        first_dim_from_boosting,
+                                                        second_dim_from_boosting
+                                                    ]
+        :param float or double lr:                  use learning_rate in xgb_param if not provided
         """
 
-        self._update_ma(grad_long_double_array, hess_long_double_array)
+        self._update_ma(grad_float_tensor, hess_float_tensor)
 
-        self.model.train_booster_layer(
-            dmatrix,
-            self.ma_grad_array / (1.0 - self.grad_ma_coef ** (self.count_of_booster_layer_training + 1.0)),
-            self.ma_hess_array / (1.0 - self.hess_ma_coef ** (self.count_of_booster_layer_training + 1.0))
+        train_double_dmatrix = xgb.DMatrix(
+            data_float_tensor.view(
+                data_float_tensor.size()[0],
+                -1
+            ).cpu().numpy()
+        )
+
+        train_grad_float_tensor = (
+            self.ma_grad_float_tensor.cpu()
+            /
+            (1.0 - self.grad_ma_coef ** (self.count_of_booster_layer_training + 1.0))
+        )
+
+        train_hess_float_tensor = (
+            self.ma_hess_float_tensor.cpu()
+            /
+            (1.0 - self.hess_ma_coef ** (self.count_of_booster_layer_training + 1.0))
+        )
+
+        n_new_trees = self.model.train_booster_layer(
+            train_double_dmatrix,
+            train_grad_float_tensor,
+            train_hess_float_tensor,
+            lr
         )
 
         self.count_of_booster_layer_training += 1
 
+        self.logger.log(
+            'Added new trees for %d nodes.' % n_new_trees,
+            'Trainer._xgb_step()'
+        )
+
     def _correct_target(self, output_float_variable, target_float_variable, e_exp_float_variable):
         """
         Correct outputs
-        :param output_float_variable:       a torch variable of
-                                            [
-                                                batch_size,
-                                                target.shape[0],
-                                                target.shape[1],
-                                                ...
-                                            ]
-                                            or
-                                            [
-                                                batch_size * add_booster_layer_after_n_batch,
-                                                target.shape[0],
-                                                target.shape[1],
-                                                ...
-                                            ]
-        :param target_float_variable:       a torch variable of
-                                            [
-                                                batch_size,
-                                                target.shape[0],
-                                                target.shape[1],
-                                                ...
-                                            ]
-                                            or
-                                            [
-                                                batch_size * add_booster_layer_after_n_batch,
-                                                target.shape[0],
-                                                target.shape[1],
-                                                ...
-                                            ]
-        :return:                            a torch variable of the same shape of output and target
+        :param Variable output_float_variable:  [
+                                                    batch_size,
+                                                    target.shape[0],
+                                                    target.shape[1],
+                                                    ...
+                                                ]
+                                                or
+                                                [
+                                                    batch_size * add_booster_layer_after_n_batch,
+                                                    target.shape[0],
+                                                    target.shape[1],
+                                                    ...
+                                                ]
+        :param Varaible target_float_variable:  [
+                                                    batch_size,
+                                                    target.shape[0],
+                                                    target.shape[1],
+                                                    ...
+                                                ]
+                                                or
+                                                [
+                                                    batch_size * add_booster_layer_after_n_batch,
+                                                    target.shape[0],
+                                                    target.shape[1],
+                                                    ...
+                                                ]
+        :return Variable:                       of the same shape of output and target
         """
 
         if self.target_regularization_coef == 1.0:
             return target_float_variable
 
         else:
-            corrected_target_float_variable = \
-                self.target_regularization_coef \
-                * target_float_variable \
-                + \
-                (1.0 - self.target_regularization_coef) \
+            corrected_target_float_variable = (
+                self.target_regularization_coef
+                * target_float_variable
+                +
+                (1.0 - self.target_regularization_coef)
                 * self.model.nn_loss.torch_link(output_float_variable, e_exp_float_variable)
+            )
             return corrected_target_float_variable
 
-    def _cal_loss(self, output_float_variable, target_float_variable,
-                  e_exp_float_variable, sample_weight_float_variable, feature_weight_float_variable,
-                  corrected_target_float_variable=None):
+    def _cal_loss(self,
+                  output_float_variable,
+                  target_float_variable,
+                  e_exp_float_variable,
+                  sample_weight_float_variable,
+                  feature_weight_float_variable,
+                  corrected_target_float_variable=None
+                  ):
 
         loss_variable = None
 
@@ -954,34 +1157,27 @@ class Trainer:
         else:
             return display_loss_variable
 
-    def _cal_grad_and_hess(self, output_float_variable, corrected_target_float_variable,
-                           e_exp_float_array, weight_float_array):
+    def _cal_grad_and_hess(self,
+                           output_float_tensor,
+                           corrected_target_float_tensor,
+                           e_exp_float_tensor,
+                           weight_float_tensor
+                           ):
 
-        if self.model.enable_cuda:
-            grad_long_double_array = \
-                self.model \
-                    .grad_of_input_to_nn_model \
-                    .data \
-                    .cpu() \
-                    .numpy() \
-                    .astype('longdouble')
-        else:
-            grad_long_double_array = \
-                self.model \
-                    .grad_of_input_to_nn_model \
-                    .data \
-                    .numpy() \
-                    .astype('longdouble')
+        grad_float_tensor = \
+            self.model \
+                .grad_of_input_to_nn_model \
+                .data
 
-        hess_long_double_array = self.model.nn_loss.hess(
-            grad_long_double_array,
-            output_float_variable.data.cpu().numpy().astype('longdouble'),
-            corrected_target_float_variable.data.cpu().numpy().astype('longdouble'),
-            e_exp_float_array.astype('longdouble'),
-            weight_float_array.astype('longdouble')
+        hess_flaot_tensor = self.model.nn_loss.hess(
+            grad_float_tensor,
+            output_float_tensor,
+            corrected_target_float_tensor,
+            e_exp_float_tensor,
+            weight_float_tensor
         )
 
-        return grad_long_double_array, hess_long_double_array
+        return grad_float_tensor, hess_flaot_tensor
 
     def _epoch_train(self, epoch):
 
@@ -996,13 +1192,13 @@ class Trainer:
 
             time_start = time()
 
-            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
-                self.train_set_loader.get_data_for_nn()
+            margin_float_tensor, target_float_tensor, e_exp_float_tensor, weight_float_tensor = \
+                self.train_set_loader.get_data_for_nn(self.model.enable_cuda)
             loss, display_loss = self._nn_step(
-                margin_float_array,
-                target_float_array,
-                e_exp_float_array,
-                weight_float_array,
+                margin_float_tensor,
+                target_float_tensor,
+                e_exp_float_tensor,
+                weight_float_tensor,
                 'loss_and_backward_and_update'
             )
 
@@ -1027,7 +1223,7 @@ class Trainer:
                 self._blank_spaces(
                     'Epoch'
                 )
-                + 'corrected batch train loss: %.16lf' %
+                + 'corrected batch train loss: %.24lf' %
                 (
                     loss / self.train_set_loader.batch_size,
                 ),
@@ -1038,7 +1234,7 @@ class Trainer:
                 self._blank_spaces(
                     'Epoch'
                 )
-                + 'original batch train loss: %.16lf' %
+                + 'original batch train loss: %.24lf' %
                 (
                     display_loss / self.train_set_loader.batch_size
                 ),
@@ -1052,48 +1248,43 @@ class Trainer:
 
             if add_booster_layer:
 
-                data_float_array, _, target_float_array, e_exp_float_array, weight_float_array = \
-                    self.train_set_loader.get_data_for_booster_layer()
+                data_float_tensor, _, target_float_tensor, e_exp_float_tensor, weight_float_tensor = \
+                    self.train_set_loader.get_data_for_booster_layer(self.model.enable_cuda)
 
                 for booster_layer_idx in range(self.train_param['n_booster_layer_to_add']):
                     time_start = time()
 
-                    _, margin_float_array, _, _, _ = \
-                        self.train_set_loader.get_data_for_booster_layer()
+                    _, margin_float_tensor, _, _, _ = \
+                        self.train_set_loader.get_data_for_booster_layer(self.model.enable_cuda)
 
-                    loss, display_loss, output_float_variable, corrected_target_float_variable = self._nn_step(
-                        margin_float_array,
-                        target_float_array,
-                        e_exp_float_array,
-                        weight_float_array,
+                    loss, display_loss, output_float_tensor, corrected_target_float_tensor = self._nn_step(
+                        margin_float_tensor,
+                        target_float_tensor,
+                        e_exp_float_tensor,
+                        weight_float_tensor,
                         'loss_and_backward'
                     )
 
-                    grad_long_double_array, hess_long_double_array = self._cal_grad_and_hess(
-                        output_float_variable,
-                        corrected_target_float_variable,
-                        e_exp_float_array,
-                        weight_float_array,
+                    grad_float_tensor, hess_float_tensor = self._cal_grad_and_hess(
+                        output_float_tensor,
+                        corrected_target_float_tensor,
+                        e_exp_float_tensor,
+                        weight_float_tensor,
                     )
 
-                    self.grad_scale_list.append(np.mean(np.abs(grad_long_double_array)))
-                    self.hess_scale_list.append(np.mean(np.abs(hess_long_double_array)))
+                    self.grad_scale_list.append(torch.mean(torch.abs(grad_float_tensor)))
+                    self.hess_scale_list.append(torch.mean(torch.abs(hess_float_tensor)))
 
                     self._xgb_step(
-                        xgb.DMatrix(
-                            data_float_array.reshape(
-                                data_float_array.shape[0],
-                                -1
-                            )
-                        ),
-                        grad_long_double_array,
-                        hess_long_double_array
+                        data_float_tensor,
+                        grad_float_tensor,
+                        hess_float_tensor
                     )
 
                     train_margin_update = self.model.predict_with_newly_added_booster(
                         xgb.DMatrix(
-                            self.train_set_loader.data.reshape(
-                                self.train_set_loader.original_sample_n,
+                            self.train_data.reshape(
+                                self.train_data.shape[0],
                                 -1
                             )
                         ),
@@ -1105,8 +1296,8 @@ class Trainer:
                     self.val_set_loader.update_margin(
                         self.model.predict_with_newly_added_booster(
                             xgb.DMatrix(
-                                self.val_set_loader.data.reshape(
-                                    self.val_set_loader.original_sample_n,
+                                self.val_data.reshape(
+                                    self.val_data.shape[0],
                                     -1
                                 )
                             ),
@@ -1132,7 +1323,7 @@ class Trainer:
                         self._blank_spaces(
                             'Epoch'
                         )
-                        + 'L1 norm of gradients: %16.8lf' %
+                        + 'L1 norm of gradients: %.24lf' %
                         (
                             self.grad_scale_list[-1],
                         ),
@@ -1143,7 +1334,7 @@ class Trainer:
                         self._blank_spaces(
                             'Epoch'
                         )
-                        + 'L1 norm of Hessian: %16.8lf' %
+                        + 'L1 norm of Hessian: %.24lf' %
                         (
                             self.hess_scale_list[-1]
                         ),
@@ -1154,10 +1345,10 @@ class Trainer:
                         self._blank_spaces(
                             'Epoch',
                         )
-                        + 'L1 norm of %d values of margin update: %.16lf' %
+                        + 'L1 norm of %d values of margin update: %.24lf' %
                         (
-                            float(np.prod(self.train_set_loader.margin.shape)),
-                            float(np.mean(np.abs(train_margin_update)))
+                            np.prod(self.train_set_loader.margin.shape),
+                            float(torch.mean(torch.abs(train_margin_update)))
                         ),
                         'Trainer._epoch_train()'
                     )
@@ -1166,7 +1357,7 @@ class Trainer:
                         self._blank_spaces(
                             'Epoch',
                         )
-                        + 'corrected batch train loss: %.16lf' %
+                        + 'corrected batch train loss: %.24lf' %
                         (
                             loss / self.train_set_loader.get_length_of_data_for_booster_layer(),
                         ),
@@ -1177,7 +1368,7 @@ class Trainer:
                         self._blank_spaces(
                             'Epoch',
                         )
-                        + 'original batch train loss: %.16lf' %
+                        + 'original batch train loss: %.24lf' %
                         (
                             display_loss / self.train_set_loader.get_length_of_data_for_booster_layer()
                         ),
@@ -1190,7 +1381,7 @@ class Trainer:
         average_running_display_loss = running_display_loss / self.train_set_loader.total_sample_n
 
         self.logger.log(
-            ' Epoch %6d ==>> average train loss: %.16lf' %
+            ' Epoch %6d ==>> average train loss: %.24lf' %
             (
                 epoch + 1,
                 average_running_display_loss
@@ -1198,12 +1389,12 @@ class Trainer:
             'Trainer._epoch_train()'
         )
         self.logger.log(
-            '                   average corrected train loss: %.16lf' %
+            '                   average corrected train loss: %.24lf' %
             average_running_loss,
             'Trainer._epoch_train()'
         )
         self.logger.log(
-            '                   elapse time: %16.8lf \n\n' %
+            '                   elapse time: %16.8lf' %
             (
                 time() - epoch_start_time
             ),
@@ -1230,28 +1421,27 @@ class Trainer:
 
         while self.val_set_loader.next_batch():
 
-            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
-                self.val_set_loader.get_data_for_nn()
-
-            display_loss, output_float_array = self._nn_step(
-                margin_float_array,
-                target_float_array,
-                e_exp_float_array,
-                weight_float_array,
+            margin_float_tensor, target_float_tensor, e_exp_float_tensor, weight_float_tensor = \
+                self.val_set_loader.get_data_for_nn(self.model.enable_cuda)
+            display_loss, output_float_tensor = self._nn_step(
+                margin_float_tensor,
+                target_float_tensor,
+                e_exp_float_tensor,
+                weight_float_tensor,
                 'loss'
             )
 
             if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
-                target_float_array_list.append(target_float_array)
-                output_float_array_list.append(output_float_array)
-                e_exp_float_array_list.append(e_exp_float_array)
+                target_float_array_list.append(target_float_tensor)
+                output_float_array_list.append(output_float_tensor)
+                e_exp_float_array_list.append(e_exp_float_tensor)
 
             running_display_loss += display_loss
 
         average_running_display_loss = running_display_loss / self.val_set_loader.total_sample_n
 
         self.logger.log(
-            ' Epoch %6d ==>> average val loss: %.16lf' %
+            ' Epoch %6d ==>> average val loss: %.24lf' %
             (
                 epoch + 1,
                 average_running_display_loss
@@ -1268,18 +1458,18 @@ class Trainer:
 
         if self.model.nn_loss.__class__.__name__ == 'BernoulliLoss':
 
-            total_target = np.concatenate(target_float_array_list)
-            total_output = np.concatenate(output_float_array_list)
-            total_e_exp = np.concatenate(e_exp_float_array_list)
+            total_target = torch.cat(target_float_array_list, 0)
+            total_output = torch.cat(output_float_array_list, 0)
+            total_e_exp = torch.cat(e_exp_float_array_list, 0)
 
             pct = self.model.nn_loss.lift_level(
                 total_output,
                 total_target,
                 self.train_param['lift_level_at'],
-                e_exp_float_array=total_e_exp
+                e_exp=total_e_exp
             )
             self.logger.log(
-                ' Epoch %6d ==>> accuracy achieved for %.4f %% of top predictions: %.4f %% \n\n' %
+                ' Epoch %6d ==>> accuracy achieved for %.4f %% of top predictions: %.4f %%' %
                 (
                     epoch + 1,
                     self.train_param['lift_level_at'] * 100.0,
@@ -1306,14 +1496,14 @@ class Trainer:
         self.train_set_loader.start_new_round(shuffle=False)
 
         while self.train_set_loader.next_batch():
-            margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
-                self.train_set_loader.get_data_for_nn()
+            margin_float_tensor, target_float_tensor, e_exp_float_tensor, weight_float_tensor = \
+                self.train_set_loader.get_data_for_nn(self.model.enable_cuda)
 
             display_loss, _ = self._nn_step(
-                margin_float_array,
-                target_float_array,
-                e_exp_float_array,
-                weight_float_array,
+                margin_float_tensor,
+                target_float_tensor,
+                e_exp_float_tensor,
+                weight_float_tensor,
                 'loss'
             )
 
@@ -1322,7 +1512,7 @@ class Trainer:
         average_running_display_loss = running_display_loss / self.train_set_loader.total_sample_n
 
         self.logger.log(
-            ' Epoch %6d ==>> average train loss: %.16lf' %
+            ' Epoch %6d ==>> average train loss: %.24lf' %
             (
                 epoch + 1,
                 average_running_display_loss
@@ -1330,7 +1520,7 @@ class Trainer:
             'Trainer._train_loss()'
         )
         self.logger.log(
-            '                   elapse time: %16.8lf \n\n' %
+            '                   elapse time: %16.8lf' %
             (
                 time() - epoch_start_time
             ),
@@ -1350,14 +1540,6 @@ class Trainer:
 
         while self.train_set_loader.next_batch():
 
-            # add_booster_layer = \
-            #     self.train_set_loader.current_batch_idx \
-            #     % self.train_param['add_booster_layer_after_n_batch'] \
-            #     == self.train_param['add_booster_layer_after_n_batch'] - 1 \
-            #     or \
-            #     self.train_set_loader.current_batch_idx \
-            #     == self.train_set_loader.total_batch_n - 1
-
             add_booster_layer = \
                 self.train_set_loader.current_batch_idx \
                 % self.train_param['add_booster_layer_after_n_batch'] \
@@ -1366,45 +1548,48 @@ class Trainer:
             if add_booster_layer:
                 time_start = time()
 
-                data_float_array, margin_float_array, target_float_array, e_exp_float_array, weight_float_array = \
-                    self.train_set_loader.get_data_for_booster_layer()
+                data_float_tensor, margin_float_tensor, target_float_tensor, e_exp_float_tensor, weight_float_tensor = \
+                    self.train_set_loader.get_data_for_booster_layer(self.model.enable_cuda)
 
-                loss, display_loss, output_float_variable, corrected_target_float_variable = self._nn_step(
-                    margin_float_array,
-                    target_float_array,
-                    e_exp_float_array,
-                    weight_float_array,
+                loss, display_loss, output_float_tensor, corrected_target_float_tensor = self._nn_step(
+                    margin_float_tensor,
+                    target_float_tensor,
+                    e_exp_float_tensor,
+                    weight_float_tensor,
                     'loss_and_backward'
                 )
 
                 running_loss += loss
                 running_display_loss += display_loss
 
-                grad_long_double_array, hess_long_double_array = self._cal_grad_and_hess(
-                    output_float_variable,
-                    corrected_target_float_variable,
-                    e_exp_float_array,
-                    weight_float_array
+                grad_float_tensor, hess_float_tensor = self._cal_grad_and_hess(
+                    output_float_tensor,
+                    corrected_target_float_tensor,
+                    e_exp_float_tensor,
+                    weight_float_tensor
                 )
 
-                self.grad_scale_list.append(np.mean(np.abs(grad_long_double_array)))
-                self.hess_scale_list.append(np.mean(np.abs(hess_long_double_array)))
+                self.grad_scale_list.append(torch.mean(torch.abs(grad_float_tensor)))
+                self.hess_scale_list.append(torch.mean(torch.abs(hess_float_tensor)))
 
-                self._xgb_step(
-                    xgb.DMatrix(
-                        data_float_array.reshape(
-                            data_float_array.shape[0],
-                            -1
-                        )
-                    ),
-                    grad_long_double_array,
-                    hess_long_double_array
-                )
+                if 'warming_up_lr' in self.model.xgb_param:
+                    self._xgb_step(
+                        data_float_tensor,
+                        grad_float_tensor,
+                        hess_float_tensor,
+                        self.model.xgb_param['warming_up_lr']
+                    )
+                else:
+                    self._xgb_step(
+                        data_float_tensor,
+                        grad_float_tensor,
+                        hess_float_tensor
+                    )
 
                 train_margin_update = self.model.predict_with_newly_added_booster(
                     xgb.DMatrix(
-                        self.train_set_loader.data.reshape(
-                            self.train_set_loader.original_sample_n,
+                        self.train_data.reshape(
+                            self.train_data.shape[0],
                             -1
                         )
                     ),
@@ -1416,8 +1601,8 @@ class Trainer:
                 self.val_set_loader.update_margin(
                     self.model.predict_with_newly_added_booster(
                         xgb.DMatrix(
-                            self.val_set_loader.data.reshape(
-                                self.val_set_loader.original_sample_n,
+                            self.val_data.reshape(
+                                self.val_data.shape[0],
                                 -1
                             )
                         ),
@@ -1443,7 +1628,7 @@ class Trainer:
                     self._blank_spaces(
                         'Warming-Up'
                     )
-                    + 'L1 norm of gradients: %16.8lf' %
+                    + 'L1 norm of gradients: %.24lf' %
                     (
                         self.grad_scale_list[-1],
                     ),
@@ -1454,7 +1639,7 @@ class Trainer:
                     self._blank_spaces(
                         'Warming-Up'
                     )
-                    + 'L1 norm of Hessian: %16.8lf' %
+                    + 'L1 norm of Hessian: %.24lf' %
                     (
                         self.hess_scale_list[-1]
                     ),
@@ -1465,10 +1650,10 @@ class Trainer:
                     self._blank_spaces(
                         'Warming-Up',
                     )
-                    + 'L1 norm of %d values of margin update: %.16lf' %
+                    + 'L1 norm of %d values of margin update: %.24lf' %
                     (
-                        float(np.prod(self.train_set_loader.margin.shape)),
-                        float(np.mean(np.abs(train_margin_update)))
+                        np.prod(self.train_set_loader.margin.shape),
+                        float(torch.mean(torch.abs(train_margin_update)))
                     ),
                     'Trainer._epoch_warming_up()'
                 )
@@ -1477,7 +1662,7 @@ class Trainer:
                     self._blank_spaces(
                         'Warming-Up',
                     )
-                    + 'corrected batch train loss: %.16lf' %
+                    + 'corrected batch train loss: %.24lf' %
                     (
                         loss / self.train_set_loader.get_length_of_data_for_booster_layer(),
                     ),
@@ -1488,7 +1673,7 @@ class Trainer:
                     self._blank_spaces(
                         'Warming-Up',
                     )
-                    + 'original batch train loss: %.16lf' %
+                    + 'original batch train loss: %.24lf' %
                     (
                         loss / self.train_set_loader.get_length_of_data_for_booster_layer(),
                     ),
@@ -1501,7 +1686,7 @@ class Trainer:
         average_running_display_loss = running_display_loss / self.train_set_loader.total_sample_n
 
         self.logger.log(
-            ' Warming-Up %6d ==>> average train loss: %.16lf' %
+            ' Warming-Up %6d ==>> average train loss: %.24lf' %
             (
                 epoch + 1,
                 average_running_display_loss
@@ -1509,12 +1694,12 @@ class Trainer:
             'Trainer._epoch_warming_up()'
         )
         self.logger.log(
-            '                        average corrected train loss: %.16lf' %
+            '                        average corrected train loss: %.24lf' %
             average_running_loss,
             'Trainer._epoch_warming_up()'
         )
         self.logger.log(
-            '                        elapse time: %16.8lf \n\n' %
+            '                        elapse time: %16.8lf' %
             (
                 time() - epoch_start_time
             ),
@@ -1549,15 +1734,16 @@ class Trainer:
     def warming_up(self, n_epoch_warming_up):
 
         self.logger.log(
+            '========= Warming-Up Starts =========',
+            'Trainer.warming_up()'
+        )
+
+        self.logger.log(
             'Number of warming-up epochs: %d' % n_epoch_warming_up,
             'Trainer.warming_up()'
         )
         self.logger.log(
             'Loss function: %s' % str(self.model.nn_loss)[:-3],
-            'Trainer.warming_up()'
-        )
-        self.logger.log(
-            'Warming-Up starts... \n',
             'Trainer.warming_up()'
         )
 
@@ -1602,7 +1788,7 @@ class Trainer:
                 raise NotImplementedError
 
         self.logger.log(
-            '========Warming-Up Finished========',
+            '======== Warming-Up Finished ========\n',
             'Trainer.warming_up()'
         )
 
@@ -1623,15 +1809,15 @@ class Trainer:
     def train(self, n_epoch_training):
 
         self.logger.log(
+            '========== Training Starts ==========',
+            'Trainer.train()'
+        )
+        self.logger.log(
             'Number of training epochs: %d' % n_epoch_training,
             'Trainer.train()'
         )
         self.logger.log(
             'Loss function: %s' % str(self.model.nn_loss)[:-3],
-            'Trainer.train()'
-        )
-        self.logger.log(
-            'Training starts... \n',
             'Trainer.train()'
         )
 
@@ -1682,7 +1868,7 @@ class Trainer:
                     index
                 )
                 self.logger.log(
-                    'Saved a model indexed by %d. \n' % index,
+                    'Saved a model indexed by %d.' % index,
                     'Trainer.train()'
                 )
 
@@ -1692,12 +1878,12 @@ class Trainer:
             index
         )
         self.logger.log(
-            'Saved a model indexed by %d. \n' % index,
+            'Saved a model indexed by %d.' % index,
             'Trainer.train()'
         )
 
         self.logger.log(
-            '========Training Finished========',
+            '========= Training Finished =========',
             'Trainer.train()'
         )
 
@@ -1715,37 +1901,89 @@ class Trainer:
         else:
             raise NotImplementedError
 
+    def margin_histogram(self, image_prefix='mh', n_bins=20):
+
+        margin = self.train_set_loader.margin.transpose(1, 2, 3, 0)
+
+        for channel_idx, channel_margin in enumerate(margin):
+
+            fig = plt.figure(figsize=(16, 14))
+
+            for first_dim_idx, first_dim_margin in enumerate(channel_margin):
+                for second_dim_idx, second_dim_margin in enumerate(first_dim_margin):
+                    y, x = np.histogram(second_dim_margin, bins=n_bins)
+
+                    image_idx = (
+                        first_dim_idx * channel_margin.__len__()
+                        + second_dim_idx + 1
+                    )
+                    subplot_idx = (
+                        channel_margin.__len__() * 10 ** (len(str(image_idx)) + 1)
+                        +
+                        first_dim_margin.__len__() * 10 ** len(str(image_idx))
+                        +
+                        image_idx
+                    )
+
+                    print(channel_margin.__len__() * 10 ** (len(str(image_idx)) + 1),
+                          first_dim_margin.__len__() * 10 ** len(str(image_idx)),
+                          subplot_idx)
+
+                    ax = fig.add_subplot(subplot_idx)
+                    ax.bar(x[:-1], y, x[1] - x[0])
+                    ax.set_title(
+                        '(%d, %d, %d)' %
+                        (
+                            channel_idx,
+                            first_dim_idx,
+                            second_dim_idx
+                        )
+                    )
+
+            fig.savefig(
+                '%s/%s/%s_%d.png' % (
+                    getcwd(),
+                    self.train_param['log_path'],
+                    image_prefix,
+                    channel_idx
+                )
+            )
+
     def detect_anomaly(self, train_labels, val_labels, threshold):
 
         train_prediction_float_array = self.model.predict(self.train_data)
         train_loss = self.model.nn_loss.individual_loss(
-            train_prediction_float_array,
-            self.train_target,
-            1.0 / self.std_per_feature_float_tensor.numpy()
-        )
+            torch.from_numpy(train_prediction_float_array),
+            torch.from_numpy(self.train_set_loader.target),
+            torch.from_numpy(np.ones([self.train_set_loader.target.shape[0], 1], dtype='float32')),
+            torch.from_numpy(np.ones([self.train_set_loader.target.shape[0], 1], dtype='float32')),
+            1.0 / self.std_per_feature_float_tensor
+        ).cpu().numpy()
 
         val_prediction_float_array = self.model.predict(self.val_data)
         val_loss = self.model.nn_loss.individual_loss(
-            val_prediction_float_array,
-            self.val_target,
-            1.0 / self.std_per_feature_float_tensor.numpy()
-        )
+            torch.from_numpy(val_prediction_float_array),
+            torch.from_numpy(self.val_set_loader.target),
+            torch.from_numpy(np.ones([self.val_set_loader.target.shape[0], 1], dtype='float32')),
+            torch.from_numpy(np.ones([self.val_set_loader.target.shape[0], 1], dtype='float32')),
+            1.0 / self.std_per_feature_float_tensor
+        ).cpu().numpy()
 
         train_ind_loss = np.concatenate(
-            [np.arange(train_loss.shape[0])[:, np.newaxis], train_loss[:, np.newaxis]],
+            [np.arange(train_loss.shape[0])[:, np.newaxis], train_loss],
             axis=1
         )
         val_ind_loss = np.concatenate(
-            [np.arange(val_loss.shape[0])[:, np.newaxis], val_loss[:, np.newaxis]],
+            [np.arange(val_loss.shape[0])[:, np.newaxis], val_loss],
             axis=1
         )
 
         train_loss = np.concatenate(
-            [train_loss[:, np.newaxis], train_labels],
+            [train_loss, train_labels],
             axis=1
         )
         val_loss = np.concatenate(
-            [val_loss[:, np.newaxis], val_labels],
+            [val_loss, val_labels],
             axis=1
         )
 
@@ -1761,45 +1999,68 @@ class Trainer:
             axis=1
         )
 
-        positive_indexed_sorted_train_loss = indxed_sorted_train_loss[
-                                             np.where(indxed_sorted_train_loss[:, 2] == 1.0)[0], :2]
-        negative_indexed_sorted_train_loss = indxed_sorted_train_loss[
-                                             np.where(indxed_sorted_train_loss[:, 2] == 0.0)[0], :2]
-        positive_indexed_sorted_val_loss = indxed_sorted_val_loss[
-                                           np.where(indxed_sorted_val_loss[:, 2] == 1.0)[0], :2]
-        negative_indexed_sorted_val_loss = indxed_sorted_val_loss[
-                                           np.where(indxed_sorted_val_loss[:, 2] == 0.0)[0], :2]
+        positive_indexed_sorted_train_loss = \
+            indxed_sorted_train_loss[np.where(indxed_sorted_train_loss[:, 2] == 1.0)[0], :2]
+        negative_indexed_sorted_train_loss = \
+            indxed_sorted_train_loss[np.where(indxed_sorted_train_loss[:, 2] == 0.0)[0], :2]
+        positive_indexed_sorted_val_loss = \
+            indxed_sorted_val_loss[np.where(indxed_sorted_val_loss[:, 2] == 1.0)[0], :2]
+        negative_indexed_sorted_val_loss = \
+            indxed_sorted_val_loss[np.where(indxed_sorted_val_loss[:, 2] == 0.0)[0], :2]
+
+        if 'log' not in listdir(getcwd()):
+            makedirs('log')
 
         fig_0 = plt.figure()
         fig_0_ax = fig_0.add_subplot(111)
-        fig_0_ax.plot(positive_indexed_sorted_train_loss[:, 0],
-                      positive_indexed_sorted_train_loss[:, 1],
-                      'rx',
-                      label='Positive Samples')
-        fig_0_ax.plot(negative_indexed_sorted_train_loss[:, 0],
-                      negative_indexed_sorted_train_loss[:, 1],
-                      'k.',
-                      label='Negative Samples')
-        fig_0_ax.plot(np.linspace(0, indxed_sorted_train_loss.shape[0], 100),
-                      threshold * np.ones(100),
-                      'b--')
+        fig_0_ax.plot(
+            positive_indexed_sorted_train_loss[:, 0],
+            positive_indexed_sorted_train_loss[:, 1],
+            'rx',
+            label='Positive Samples'
+        )
+        fig_0_ax.plot(
+            negative_indexed_sorted_train_loss[:, 0],
+            negative_indexed_sorted_train_loss[:, 1],
+            'k.',
+            label='Negative Samples'
+        )
+        fig_0_ax.plot(
+            np.linspace(
+                0,
+                indxed_sorted_train_loss.shape[0],
+                100
+            ),
+            threshold * np.ones(100),
+            'b--'
+        )
         fig_0_ax.legend()
         fig_0_ax.set_title('Train Samples')
         fig_0.savefig('./log/train_samples_anomaly_detection.png')
 
         fig_1 = plt.figure()
         fig_1_ax = fig_1.add_subplot(111)
-        fig_1_ax.plot(positive_indexed_sorted_val_loss[:, 0],
-                      positive_indexed_sorted_val_loss[:, 1],
-                      'rx',
-                      label='Positive Samples')
-        fig_1_ax.plot(negative_indexed_sorted_val_loss[:, 0],
-                      negative_indexed_sorted_val_loss[:, 1],
-                      'k.',
-                      label='Negative Samples')
-        fig_1_ax.plot(np.linspace(0, indxed_sorted_val_loss.shape[0], 100),
-                      threshold * np.ones(100),
-                      'b--')
+        fig_1_ax.plot(
+            positive_indexed_sorted_val_loss[:, 0],
+            positive_indexed_sorted_val_loss[:, 1],
+            'rx',
+            label='Positive Samples'
+        )
+        fig_1_ax.plot(
+            negative_indexed_sorted_val_loss[:, 0],
+            negative_indexed_sorted_val_loss[:, 1],
+            'k.',
+            label='Negative Samples'
+        )
+        fig_1_ax.plot(
+            np.linspace(
+                0,
+                indxed_sorted_val_loss.shape[0],
+                100
+            ),
+            threshold * np.ones(100),
+            'b--'
+        )
         fig_1_ax.legend()
         fig_1_ax.set_title('Val Samples')
         fig_1.savefig('./log/val_samples_anomaly_detection.png')
@@ -1808,3 +2069,4 @@ class Trainer:
                train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
                val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
                val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')
+

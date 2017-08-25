@@ -130,7 +130,7 @@ class ResRegNet(nn.Module):
     def __init__(self,
                  n_channel_from_boosting, first_dim_from_boosting, second_dim_from_boosting,
                  n_block, intermediate_size_in_block,
-                 dropout_prob=0.5):
+                 dropout_prob=0.0):
         """
         intermedia_size_in_block: array like, element[i] represents the size of
                                   intermedia node in i-th block
