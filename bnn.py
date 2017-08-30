@@ -4,7 +4,6 @@ from copy import deepcopy
 from os import makedirs, listdir, getcwd
 from pickle import dump, load
 from time import time
-from warnings import warn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,12 +12,13 @@ import torch.optim as optim
 import xgboost as xgb
 from torch.autograd import Variable
 
+from data_loader import DataLoader, ProbWeightedDataLoader
 from log_to_file import Logger
 
 
 class BoostNN:
 
-    abs_ave_grad_and_hess_floor = 1e-45
+    hessian_constant = 1e-8
 
     def __init__(self, **kwargs):
         """
@@ -147,7 +147,7 @@ class BoostNN:
         self.booster_layer_seed_list = [
             [
                 [
-                    int(np.random.rand() * 1e5)
+                    np.random.randint(0, high=100000000)
                     for _ in range(self.second_dim_from_boosting)
                     ] for _ in range(self.first_dim_from_boosting)
                 ] for _ in range(self.n_channel_from_boosting)
@@ -227,128 +227,35 @@ class BoostNN:
                         )
                     )
 
-                    if abs_ave_of_grad > self.abs_ave_grad_and_hess_floor:
-
-                        train_grad = grad[:, channel_idx, first_dim_idx, second_dim_idx] / abs_ave_of_grad
-
-                        self._add_booster_layer(
-                            channel_idx,
-                            first_dim_idx,
-                            second_dim_idx,
-                            lr
-                        )
-
-                        abs_ave_of_hess = torch.mean(
-                            torch.abs(
-                                hess[:, channel_idx, first_dim_idx, second_dim_idx]
-                            )
-                        )
-
-                        if abs_ave_of_hess < self.abs_ave_grad_and_hess_floor:
-                            train_hess = torch.ones(n_rows)
-                            self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
-                                abs_ave_of_grad
-                            )
-                        else:
-                            train_hess = hess[:, channel_idx, first_dim_idx, second_dim_idx] / abs_ave_of_hess
-                            self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
-                                abs_ave_of_grad / abs_ave_of_hess
-                            )
-
-                        self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
-                            dmatrix,
-                            train_grad.numpy().tolist(),
-                            train_hess.numpy().tolist()
-                        )
-
-        return np.sum(self.newly_updated_booster_layer_list)
-
-    def new_train_booster_layer(self, dmatrix, grad, hess, lr=None):
-        """
-        Train a booster layer.
-
-        :type dmatrix:  xgb.core.DMatrix
-        :type grad:     torch.FloatTensor
-        :type hess:     torch.FloatTensor
-        :type lr:       float or double
-
-        :param dmatrix: [
-                            batch_size * add_booster_layer_after_n_batch,
-                            n_channel_to_boosting * first_dim_to_boosting * second_dim_to_boosting
-                        ]
-                        on host
-        :param grad:    [
-                            batch_size * add_booster_layer_after_n_batch,
-                            n_channel_from_boosting,
-                            first_dim_from_boosting,
-                            second_dim_from_boosting
-                        ]
-                        on host
-        :param hess:    [
-                            batch_size * add_booster_layer_after_n_batch,
-                            n_channel_from_boosting,
-                            first_dim_from_boosting,
-                            second_dim_from_boosting
-                        ]
-                        on host
-        :param lr:      use learning_rate in xgb_param if not provided
-        """
-
-        n_rows = dmatrix.num_row()
-
-        dmatrix.set_base_margin(
-            np.zeros(
-                n_rows,
-                dtype='float32'
-            )
-        )
-
-        grad = grad.numpy()
-        hess = hess.numpy()
-
-        for channel_idx in range(self.n_channel_from_boosting):
-            for first_dim_idx in range(self.first_dim_from_boosting):
-                for second_dim_idx in range(self.second_dim_from_boosting):
-
-                    abs_ave_of_grad = np.mean(
-                        np.abs(
-                            grad[:, channel_idx, first_dim_idx, second_dim_idx]
-                        )
+                    train_grad = torch.div(
+                        grad[:, channel_idx, first_dim_idx, second_dim_idx],
+                        abs_ave_of_grad
                     )
 
-                    if abs_ave_of_grad > self.abs_ave_grad_and_hess_floor:
+                    train_hess = torch.div(
+                        torch.add(
+                            hess[:, channel_idx, first_dim_idx, second_dim_idx],
+                            self.hessian_constant
+                        ),
+                        abs_ave_of_grad
+                    )
 
-                        self._add_booster_layer(
-                            channel_idx,
-                            first_dim_idx,
-                            second_dim_idx,
-                            lr
-                        )
+                    self._add_booster_layer(
+                        channel_idx,
+                        first_dim_idx,
+                        second_dim_idx,
+                        lr
+                    )
 
-                        scaling_coef = \
-                            abs_ave_of_grad \
-                            / np.mean(
-                                np.abs(
-                                    hess[:, channel_idx, first_dim_idx, second_dim_idx]
-                                )
-                            )
+                    self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
+                        1.0
+                    )
 
-                        scaling_coef = 1.0 if scaling_coef > 1.0 else scaling_coef
-
-                        self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
-                            scaling_coef
-                        )
-
-                        train_grad = \
-                            grad[:, channel_idx, first_dim_idx, second_dim_idx] / scaling_coef
-
-                        train_hess = hess[:, channel_idx, first_dim_idx, second_dim_idx] + 1e-8
-
-                        self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
-                            dmatrix,
-                            train_grad.tolist(),
-                            train_hess.tolist()
-                        )
+                    self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
+                        dmatrix,
+                        train_grad.numpy().tolist(),
+                        train_hess.numpy().tolist()
+                    )
 
         return np.sum(self.newly_updated_booster_layer_list)
 
@@ -559,138 +466,6 @@ class BoostNN:
         self.enable_cuda = self.nn_param['enable_cuda']
 
 
-class DataLoader:
-    def __init__(self, data, target, batch_size, nn_input_shape, e_exp=None, weight=None):
-        if not (isinstance(data, np.ndarray) and isinstance(target, np.ndarray)):
-            raise ValueError('Error: data or target is not numpy.ndarray.')
-        if not (data.ndim == 4 and (target.ndim == 2 or target.ndim == 4)):
-            raise ValueError('Error: data should be four-dimensional and target should be two-dimensional.')
-        if data.shape[0] != target.shape[0]:
-            raise ValueError('Error: The numbers of samples in data and target should be the same.')
-
-        if batch_size > data.shape[0]:
-            warn('batch_size is larger than the sample size, so DataLoader forces batch_size to be the sample size.')
-            batch_size = data.shape[0]
-
-        if not (data.dtype == 'float32' and target.dtype == 'float32'):
-            warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
-            self.data = data.astype('float32')
-            self.target = target.astype('float32')
-        else:
-            self.data = data
-            self.target = target
-
-        if e_exp is None:
-            self.e_exp = np.ones([self.data.shape[0], 1], dtype='float32')
-        else:
-            if not isinstance(e_exp, np.ndarray):
-                raise ValueError('Error: e_exp is not numpy.ndarray.')
-            if not e_exp.ndim == 2:
-                raise ValueError('Error: e_exp should be a two-dimensional column vector.')
-            if e_exp.dtype == 'float32':
-                self.e_exp = e_exp
-            else:
-                warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
-                self.e_exp = e_exp.astype('float32')
-
-        if weight is None:
-            self.weight = np.ones([self.data.shape[0], 1], dtype='float32')
-        else:
-            if not isinstance(weight, np.ndarray):
-                raise ValueError('Error: weight is not numpy.ndarray.')
-            if not weight.ndim == 2:
-                raise ValueError('Error: weight should be a two-dimensional column vector.')
-            if weight.dtype == 'float32':
-                self.weight = weight
-            else:
-                warn('The data type of data and target should be float 32. DataLoader has converted them to float32.')
-                self.weight = weight.astype('float32')
-
-        self.batch_size = int(batch_size)
-
-        self.original_sample_n = data.shape[0]
-        self.original_sample_index_list = range(self.original_sample_n)
-
-        self.total_batch_n = self.original_sample_n / self.batch_size
-        self.total_sample_n = self.total_batch_n * self.batch_size
-        self.total_sample_index_list = self._reset_total_sample_index_list(shuffle=False)
-
-        self.current_batch_idx = -1
-        self.sample_idx_in_current_batch_list = []
-
-        self.used_sample_index_list = []
-
-        self.margin = np.zeros([self.original_sample_n] + nn_input_shape, dtype='float32')
-
-    def update_margin(self, margin_update):
-        """
-        Update the margin.
-        :param torch.FloatTensor margin_update:   [self.data.shape[0]] + nn_input_shape
-        """
-        self.margin += margin_update.cpu().numpy()
-
-    def next_batch(self):
-        """
-        Get a batch.
-        :return:    a boolean value whether the current batch is the last one
-        """
-        if self.current_batch_idx < self.total_batch_n - 1:
-            self.current_batch_idx += 1
-            self.sample_idx_in_current_batch_list = self.total_sample_index_list[
-                                                    (self.current_batch_idx * self.batch_size):
-                                                    (self.current_batch_idx + 1) * self.batch_size
-                                                    ]
-            self.used_sample_index_list.extend(self.sample_idx_in_current_batch_list)
-            return True
-        else:
-            self.sample_idx_in_current_batch_list = []
-            return False
-
-    def get_data_for_nn(self, enable_cuda):
-        if enable_cuda:
-            return torch.from_numpy(self.margin[self.sample_idx_in_current_batch_list]).cuda(), \
-                   torch.from_numpy(self.target[self.sample_idx_in_current_batch_list]).cuda(), \
-                   torch.from_numpy(self.e_exp[self.sample_idx_in_current_batch_list]).cuda(), \
-                   torch.from_numpy(self.weight[self.sample_idx_in_current_batch_list]).cuda(),
-        else:
-            return torch.from_numpy(self.margin[self.sample_idx_in_current_batch_list]), \
-                   torch.from_numpy(self.target[self.sample_idx_in_current_batch_list]), \
-                   torch.from_numpy(self.e_exp[self.sample_idx_in_current_batch_list]), \
-                   torch.from_numpy(self.weight[self.sample_idx_in_current_batch_list]),
-
-    def get_data_for_booster_layer(self, enable_cuda):
-        if enable_cuda:
-            return torch.from_numpy(self.data[self.used_sample_index_list]).cuda(), \
-                   torch.from_numpy(self.margin[self.used_sample_index_list]).cuda(), \
-                   torch.from_numpy(self.target[self.used_sample_index_list]).cuda(), \
-                   torch.from_numpy(self.e_exp[self.used_sample_index_list]).cuda(), \
-                   torch.from_numpy(self.weight[self.used_sample_index_list]).cuda()
-        else:
-            return torch.from_numpy(self.data[self.used_sample_index_list]), \
-                   torch.from_numpy(self.margin[self.used_sample_index_list]), \
-                   torch.from_numpy(self.target[self.used_sample_index_list]), \
-                   torch.from_numpy(self.e_exp[self.used_sample_index_list]), \
-                   torch.from_numpy(self.weight[self.used_sample_index_list])
-
-    def get_length_of_data_for_booster_layer(self):
-        return self.used_sample_index_list.__len__()
-
-    def reset_used_data(self):
-        self.used_sample_index_list = []
-
-    def start_new_round(self, shuffle=True):
-        self.current_batch_idx = -1
-        self.total_sample_index_list = self._reset_total_sample_index_list(shuffle=shuffle)
-        self.sample_idx_in_current_batch_list = []
-        self.used_sample_index_list = []
-
-    def _reset_total_sample_index_list(self, shuffle=True):
-        if shuffle:
-            return np.random.permutation(self.original_sample_index_list)[:self.total_sample_n].tolist()
-        else:
-            return self.original_sample_index_list[:self.total_sample_n]
-
-
 class Trainer:
     def __init__(self, model, train_param):
 
@@ -852,7 +627,7 @@ class Trainer:
         )
 
         # put data into a DataLoader
-        self.train_set_loader = DataLoader(
+        self.train_set_loader = ProbWeightedDataLoader(
             self.train_data,
             self.train_target,
             self.train_param['batch_size'],
@@ -862,7 +637,8 @@ class Trainer:
                 self.model.second_dim_from_boosting
             ],
             e_exp=self.train_e_exp,
-            weight=self.train_weight
+            weight=self.train_weight,
+            train_param=self.train_param
         )
 
         self.val_set_loader = DataLoader(
@@ -875,7 +651,8 @@ class Trainer:
                 self.model.second_dim_from_boosting
             ],
             e_exp=self.val_e_exp,
-            weight=self.val_weight
+            weight=self.val_weight,
+            train_param=self.train_param
         )
         self.logger.log(
             'train_set_loader and val_set_loader DONE.\n',
@@ -1291,7 +1068,12 @@ class Trainer:
                         False
                     )
 
-                    self.train_set_loader.update_margin(train_margin_update)
+                    self.train_set_loader.update_margin(
+                        train_margin_update,
+                        epoch + 1,
+                        self.model.nn_loss.torch_link,
+                        self.model
+                    )
 
                     self.val_set_loader.update_margin(
                         self.model.predict_with_newly_added_booster(
@@ -1302,7 +1084,10 @@ class Trainer:
                                 )
                             ),
                             True
-                        )
+                        ),
+                        epoch + 1,
+                        self.model.nn_loss.torch_link,
+                        self.model
                     )
 
                     booster_time = time() - time_start
@@ -1596,7 +1381,12 @@ class Trainer:
                     False
                 )
 
-                self.train_set_loader.update_margin(train_margin_update)
+                self.train_set_loader.update_margin(
+                    train_margin_update,
+                    epoch + 1,
+                    self.model.nn_loss.torch_link,
+                    self.model
+                )
 
                 self.val_set_loader.update_margin(
                     self.model.predict_with_newly_added_booster(
@@ -1607,7 +1397,10 @@ class Trainer:
                             )
                         ),
                         True
-                    )
+                    ),
+                    epoch + 1,
+                    self.model.nn_loss.torch_link,
+                    self.model
                 )
 
                 booster_time = time() - time_start
@@ -2069,4 +1862,3 @@ class Trainer:
                train_ind_loss[train_ind_loss[:, 1] > threshold, 0].astype('int'), \
                val_ind_loss[val_ind_loss[:, 1] < threshold, 0].astype('int'), \
                val_ind_loss[val_ind_loss[:, 1] > threshold, 0].astype('int')
-
