@@ -61,12 +61,16 @@ class BoostNN:
         self.grad_of_input_to_nn_model = None
         self.newly_updated_booster_layer_list = None
 
-        if 'path_prefix' in kwargs:
-            path_prefix = kwargs['path_prefix']
-            if 'index' in kwargs:
-                self.load(path_prefix, kwargs['index'])
+        if 'path' in kwargs:
+            path = kwargs['path']
+            if 'index' in kwargs and 'prefix' in kwargs:
+                self.load(path, prefix=kwargs['prefix'], index=kwargs['index'])
+            elif 'index' in kwargs and not 'prefix' in kwargs:
+                self.load(path, index=kwargs['index'])
+            elif not 'index' in kwargs and 'prefix' in kwargs:
+                self.load(path, prefix=kwargs['prefix'])
             else:
-                self.load(path_prefix)
+                self.load(path)
         else:
             self.nn_model = kwargs['nn_model']
             self.nn_model.float()
