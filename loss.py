@@ -1,7 +1,7 @@
 from abc import abstractmethod, ABCMeta
 from copy import deepcopy
 
-from torch import FloatTensor, diag, mm, sum, ones, zeros, exp, log, sort
+from torch import FloatTensor, diag, mm, sum, ones, zeros, exp, log, sort, linspace
 from torch.autograd import Variable
 from torch.nn import Module
 
@@ -217,3 +217,48 @@ class BernoulliLoss(Loss):
                 break
 
         return pct
+
+    @staticmethod
+    def lift_plot(output, target, n_point=101, e_exp=None):
+        """
+        Lift level at a certain value.
+        :param FloatTensor output:          [n_sample, 1]
+        :param FloatTensor target:          [n_sample, 1]
+        :param float or double n_point:     value
+        :param FloatTensor or None e_exp:   [n_sample, 1]
+        :return FloatTensor x_vec:          [n_point]
+        :return FloatTensor pct_vec:        [n_point]
+        """
+        output_vec = output[:, 0]
+        target_vec = target[:, 0]
+
+        if e_exp is None:
+            if output.is_cuda:
+                e_exp_vec = ones(output_vec.size()).cuda()
+            else:
+                e_exp_vec = ones(output_vec.size())
+        else:
+            e_exp_vec = e_exp[:, 0]
+
+        x_vec = linspace(0.0, 1.0, n_point)
+        required_exposure_vec = x_vec * sum(e_exp_vec)
+        total_positive = sum(target_vec)
+
+        _, sorted_indices_val_prediction = sort(-output_vec)
+
+        accumulated_exposure = 0.0
+        accumulated_positive = 0.0
+        lift_vec = zeros(n_point)
+        lift_vec[-1] = 1.0
+
+        x_idx = 1
+        for item in sorted_indices_val_prediction:
+
+            accumulated_positive += target_vec[item]
+            accumulated_exposure += e_exp_vec[item]
+
+            if accumulated_exposure > required_exposure_vec[x_idx]:
+                lift_vec[x_idx] = accumulated_positive / total_positive
+                x_idx += 1
+
+        return x_vec, lift_vec

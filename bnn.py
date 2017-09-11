@@ -1265,11 +1265,42 @@ class Trainer:
                 e_exp=total_e_exp
             )
             self.logger.log(
-                ' Epoch %6d ==>> accuracy achieved for %.4f %% of top predictions: %.4f %%' %
+                ' Epoch %6d ==>> Lift achieved for %.5f %% of top predictions: %.4f %%' %
                 (
                     epoch + 1,
                     self.train_param['lift_level_at'] * 100.0,
                     pct * 100.0
+                ),
+                'Trainer._epoch_val()'
+            )
+
+            x_float_tensor, lift_float_tensor = self.model.nn_loss.lift_plot(
+                total_output,
+                total_target,
+                e_exp=total_e_exp
+            )
+
+            x_string = ''
+            for x in x_float_tensor:
+                x_string += '%.5f\t' % x
+            lift_string = ''
+            for lift in lift_float_tensor:
+                lift_string += '%.5f\t' % lift
+
+            self.logger.log(
+                ' Epoch %6d ==>> Lift Plot x: %s' %
+                (
+                    epoch + 1,
+                    x_string
+                ),
+                'Trainer._epoch_val()'
+            )
+
+            self.logger.log(
+                ' Epoch %6d ==>> Lift Plot y: %s \n' %
+                (
+                    epoch + 1,
+                    lift_string
                 ),
                 'Trainer._epoch_val()'
             )
