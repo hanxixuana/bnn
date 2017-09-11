@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from abc import abstractmethod, ABCMeta
 from copy import deepcopy
 

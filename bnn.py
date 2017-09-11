@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from copy import deepcopy
 from os import makedirs, listdir, getcwd
 from pickle import dump, load

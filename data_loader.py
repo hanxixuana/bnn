@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from warnings import warn
 
 import numpy as np
@@ -208,6 +206,14 @@ class ProbWeightedDataLoader:
             self.use_prob_as_weight_after_n_epoch = train_param['use_prob_as_weight_after_n_epoch']
         else:
             self.use_prob_as_weight_after_n_epoch = 0
+        if 'power_of_prob_as_weight' in train_param:
+            self.power_of_prob_as_weight = train_param['power_of_prob_as_weight']
+        else:
+            self.power_of_prob_as_weight = 1.0
+        if 'coef_of_prob_as_weight' in train_param:
+            self.coef_of_prob_as_weight = train_param['coef_of_prob_as_weight']
+        else:
+            self.coef_of_prob_as_weight = 1.0
 
     def update_margin(self, margin_update, epoch_idx, link, bnn):
         """
@@ -219,13 +225,31 @@ class ProbWeightedDataLoader:
         """
         self.margin += margin_update.cpu().numpy()
         if epoch_idx > self.use_prob_as_weight_after_n_epoch:
-            self.weight = link(
-                bnn.nn_forward(
-                    torch.from_numpy(self.margin),
-                    requires_grad=False
-                ).data,
-                torch.from_numpy(self.e_exp)
-            ).numpy()
+            self.weight = (
+                self.coef_of_prob_as_weight
+                *
+                link(
+                    bnn.nn_forward(
+                        torch.from_numpy(self.margin),
+                        requires_grad=False
+                    ).data,
+                    torch.from_numpy(self.e_exp)
+                ).numpy()
+                **
+                self.power_of_prob_as_weight
+            )
+            # self.weight = (
+            #     self.coef_of_prob_as_weight
+            #     *
+            #     np.exp(
+            #         bnn.nn_forward(
+            #             torch.from_numpy(self.margin),
+            #             requires_grad=False
+            #         ).data.numpy()
+            #     )
+            #     **
+            #     self.power_of_prob_as_weight
+            # )
 
     def next_batch(self):
         """

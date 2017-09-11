@@ -1,5 +1,3 @@
-#!/usr/bin/env python
-
 from copy import deepcopy
 from multiprocessing import Pool
 
