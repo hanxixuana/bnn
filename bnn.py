@@ -397,9 +397,13 @@ class BoostNN:
 
         return predictions
 
-    def save(self, path, index=None):
-        if index:
+    def save(self, path, prefix=None, index=None):
+        if index and prefix:
+            file_name = '%s/%s/%s_bnn_%d.dat' % (getcwd(), path, prefix, index)
+        elif index and not prefix:
             file_name = '%s/%s/bnn_%d.dat' % (getcwd(), path, index)
+        elif not index and prefix:
+            file_name = '%s/%s/%s_bnn.dat' % (getcwd(), path, prefix)
         else:
             file_name = '%s/%s/bnn.dat' % (getcwd(), path)
         if path not in listdir(getcwd()):
@@ -433,11 +437,16 @@ class BoostNN:
                 fp
             )
 
-    def load(self, path, index=None):
-        if index:
+    def load(self, path, prefix=None, index=None):
+        if index and prefix:
+            file_name = '%s/%s_bnn_%d.dat' % (path, prefix, index)
+        elif index and not prefix:
             file_name = '%s/bnn_%d.dat' % (path, index)
+        elif not index and prefix:
+            file_name = '%s/%s_bnn.dat' % (path, prefix)
         else:
             file_name = '%s/bnn.dat' % path
+
         with open(file_name, 'rb') as fp:
             loaded_content = load(fp)
 
@@ -1651,11 +1660,17 @@ class Trainer:
             else:
                 raise NotImplementedError
 
-            if self.count_of_warming_and_training % self.train_param['save_model_after_n_epoch'] \
-                    == (self.train_param['save_model_after_n_epoch'] - 1):
+            if (
+                    self.count_of_warming_and_training
+                    %
+                    self.train_param['save_model_after_n_epoch']
+                    ==
+                    (self.train_param['save_model_after_n_epoch'] - 1)
+            ):
                 index = int(time())
                 self.model.save(
                     self.train_param['model_save_path'],
+                    self.logger.get_training_start_time(),
                     index
                 )
                 self.logger.log(
@@ -1666,6 +1681,7 @@ class Trainer:
         index = int(time())
         self.model.save(
             self.train_param['model_save_path'],
+            self.logger.get_training_start_time(),
             index
         )
         self.logger.log(
@@ -1674,7 +1690,7 @@ class Trainer:
         )
 
         self.logger.log(
-            '========= Training Finished =========',
+            '========= Training Finished =========\n\n',
             'Trainer.train()'
         )
 
@@ -1716,9 +1732,9 @@ class Trainer:
                         image_idx
                     )
 
-                    print(channel_margin.__len__() * 10 ** (len(str(image_idx)) + 1),
-                          first_dim_margin.__len__() * 10 ** len(str(image_idx)),
-                          subplot_idx)
+                    # print(channel_margin.__len__() * 10 ** (len(str(image_idx)) + 1),
+                    #       first_dim_margin.__len__() * 10 ** len(str(image_idx)),
+                    #       subplot_idx)
 
                     ax = fig.add_subplot(subplot_idx)
                     ax.bar(x[:-1], y, x[1] - x[0])

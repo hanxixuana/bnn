@@ -1,11 +1,13 @@
 import logging
 import os
+from copy import deepcopy
 from time import strftime, localtime
 
 
 class Logger:
     def __init__(self, ID=None, to_stdout=False, path=None):
         file_name = strftime("%b-%d-%Y_%H:%M:%S", localtime())
+        self.training_start_time = deepcopy(file_name)
         if ID:
             file_name += "_" + ID + ".log"
         else:
@@ -27,3 +29,6 @@ class Logger:
 
     def log(self, content, name=" "):
         self.logger.info("%s -> %s: %s" % (strftime("%b-%d-%Y %H:%M:%S", localtime()), name, content))
+
+    def get_training_start_time(self):
+        return self.training_start_time
