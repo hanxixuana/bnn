@@ -288,16 +288,17 @@ class BoostNN:
 
         return outputs
 
-    def predict(self, x):
+    def predict(self, x, only_booster_layer=False):
         """
         Predict.
-        :param np.array x:  [
-                                batch_size,
-                                n_channel_to_boosting,
-                                first_dim_to_boosting,
-                                second_dim_to_boosting
-                            ]
-        :return np.array:   nn output
+        :param np.array x:                      [
+                                                    batch_size,
+                                                    n_channel_to_boosting,
+                                                    first_dim_to_boosting,
+                                                    second_dim_to_boosting
+                                                ]
+        :param bool only_booster_layer:         if only use booster layer
+        :return np.array or torch.FloatTensor:  output
         """
 
         n_rows = x.shape[0]
@@ -335,9 +336,11 @@ class BoostNN:
                             second_dim_idx
                         )
 
-        predictions = self.nn_forward(xgb_predictions, requires_grad=False)
-
-        return predictions.data.numpy()
+        if not only_booster_layer:
+            predictions = self.nn_forward(xgb_predictions, requires_grad=False)
+            return predictions.data.numpy()
+        else:
+            return xgb_predictions
 
     def _booster_predict(self, dmatrix, channel_idx, first_dim_idx, second_dim_idx):
 
@@ -436,7 +439,9 @@ class BoostNN:
                         self.n_channel_from_boosting,
                         self.first_dim_from_boosting,
                         self.second_dim_from_boosting
-                    ]
+                    ],
+
+                    'newly_updated_booster_layer_list': self.newly_updated_booster_layer_list
                 },
                 fp
             )
@@ -473,6 +478,8 @@ class BoostNN:
             self.n_channel_from_boosting = loaded_content['dims_from_booster_layer'][0]
             self.first_dim_from_boosting = loaded_content['dims_from_booster_layer'][1]
             self.second_dim_from_boosting = loaded_content['dims_from_booster_layer'][2]
+
+            self.newly_updated_booster_layer_list = loaded_content['newly_updated_booster_layer_list']
 
         self.enable_cuda = self.nn_param['enable_cuda']
 
@@ -665,6 +672,27 @@ class Trainer:
             weight=self.val_weight,
             train_param=self.train_param
         )
+
+        self.train_set_loader.update_margin(
+            self.model.predict(
+                self.train_data,
+                only_booster_layer=True
+            ),
+            0,
+            self.model.nn_loss.torch_link,
+            self.model
+        )
+
+        self.val_set_loader.update_margin(
+            self.model.predict(
+                self.val_data,
+                only_booster_layer=True
+            ),
+            0,
+            self.model.nn_loss.torch_link,
+            self.model
+        )
+
         self.logger.log(
             'train_set_loader and val_set_loader DONE.\n',
             'Trainer.input_data()'

@@ -13,13 +13,60 @@ class PosELU(nn.Module):
         self.inplace = inplace
 
     def forward(self, input):
-        return F.elu(input, self.alpha, self.inplace) + self.alpha
+        if isinstance(input, torch.autograd.variable.Variable):
+            return F.elu(input, self.alpha, self.inplace) + self.alpha
+        else:
+            return (
+                F.elu(torch.autograd.Variable(input), self.alpha, self.inplace)
+                +
+                self.alpha
+            ).data
+
+    def inverse(self, x):
+        return (
+            (x - self.alpha) * (x >= self.alpha).float()
+            +
+            torch.log(x / self.alpha) * (x < self.alpha).float()
+        )
 
     def __repr__(self):
         inplace_str = ', inplace' if self.inplace else ''
         return self.__class__.__name__ + ' (' \
             + 'alpha=' + str(self.alpha) \
             + inplace_str + ')'
+
+
+class LearnableTanh(nn.Module):
+
+    def __init__(self, in_features, alpha_bound=1.0):
+        super(LearnableTanh, self).__init__()
+        self.alpha = nn.parameter.Parameter(
+            torch.Tensor(1, in_features)
+        )
+        self.in_features = in_features
+        self.alpha_bound = alpha_bound
+        self.reset_parameters(self.alpha_bound)
+
+    def reset_parameters(self, alpha_bound):
+        self.alpha.data.uniform_(-alpha_bound, alpha_bound)
+
+    def forward(self, x):
+        # max(0,x) + min(0, alpha * (exp(x) - 1))
+        result = torch.tanh(x) - self.alpha.expand(x.size(0), self.alpha.size(1))
+        return result
+
+    def __repr__(self):
+        string = self.__class__.__name__ \
+                 + ' (' + 'ncol: ' + str(self.in_features) + ', ' \
+                 + 'alpha_bound: ' + str(self.alpha_bound) + ', ' \
+                 + 'alpha=['
+        for idx, item in enumerate(self.alpha.data[0]):
+            string += str(item) + ','
+            if idx > 1:
+                string += '...'
+                break
+        string += '])'
+        return string
 
 
 class LearnableELU(nn.Module):
@@ -58,23 +105,62 @@ class LearnableELU(nn.Module):
             + inplace_str + ')'
 
 
+class ConstantMask(nn.Module):
+
+    def __init__(self, in_features, prob=1.0):
+        super(ConstantMask, self).__init__()
+        self.mask = nn.parameter.Parameter(
+            torch.Tensor(1, in_features),
+            requires_grad=False
+        )
+        self.in_features = in_features
+        self.prob = prob
+        self.reset_parameters(self.prob)
+
+    def reset_parameters(self, prob):
+        self.mask.data.uniform_()
+        self.mask.data.apply_(lambda x: x < prob)
+
+    def forward(self, x):
+        return (
+            x
+            *
+            self.mask.expand(
+                x.size(0),
+                self.mask.size(1)
+            )
+        )
+
+    def __repr__(self):
+        return self.__class__.__name__ + ' (' \
+            + 'ncol: ' + str(self.in_features) + ' ' \
+            + 'Prob: ' + str(self.prob) + ')'
+
+
 class AvePosLinear(nn.Module):
 
-    def __init__(self, in_features, out_features, fun=PosELU, bias=True):
+    def __init__(self, in_features, out_features, fun=PosELU, normalized_init=False, bias=True):
         super(AvePosLinear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.normalized_init = normalized_init
         self.fun = fun()
         self.weight = nn.parameter.Parameter(torch.Tensor(out_features, in_features))
         if bias:
             self.bias = nn.parameter.Parameter(torch.Tensor(out_features))
         else:
             self.register_parameter('bias', None)
-        self.reset_parameters()
+        self.reset_parameters(self.normalized_init)
 
-    def reset_parameters(self):
+    def reset_parameters(self, normalized_init):
         stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
+        if normalized_init:
+            self.weight.data.uniform_(-stdv, stdv)
+            self.weight.data = self.fun.forward(self.weight.data)
+            self.weight.data /= torch.sum(self.weight.data)
+            self.weight.data = self.fun.inverse(self.weight.data)
+        else:
+            self.weight.data.uniform_(-stdv, stdv)
         if self.bias is not None:
             self.bias.data.uniform_(-stdv, stdv)
 
@@ -88,40 +174,8 @@ class AvePosLinear(nn.Module):
 
     def __repr__(self):
         return self.__class__.__name__ + ' (' \
-            + self.fun.__class__.__name__ + ', ' \
-            + str(self.in_features) + ' -> ' \
-            + str(self.out_features) + ')'
-
-
-class AveExpLinear(nn.Module):
-
-    def __init__(self, in_features, out_features, bias=True):
-        super(AveExpLinear, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.parameter.Parameter(torch.Tensor(out_features, in_features))
-        if bias:
-            self.bias = nn.parameter.Parameter(torch.Tensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        stdv = 1. / math.sqrt(self.weight.size(1))
-        self.weight.data.uniform_(-stdv, stdv)
-        if self.bias is not None:
-            self.bias.data.uniform_(-stdv, stdv)
-
-    def forward(self, input):
-        weight = torch.exp(self.weight)
-        weight = weight / torch.sum(weight).expand_as(weight)
-        if self.bias is None:
-            return self._backend.Linear()(input, weight)
-        else:
-            return self._backend.Linear()(input, weight, self.bias)
-
-    def __repr__(self):
-        return self.__class__.__name__ + ' (' \
+            + self.fun.__repr__() + ', ' \
+            + 'NI: ' + str(self.normalized_init) + ', ' \
             + str(self.in_features) + ' -> ' \
             + str(self.out_features) + ')'
 
