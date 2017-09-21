@@ -17,6 +17,7 @@ from log_to_file import Logger
 class BoostNN:
 
     hessian_constant = 1e-8
+    nonzero_constant = 1e-40
 
     def __init__(self, **kwargs):
         """
@@ -76,7 +77,10 @@ class BoostNN:
             self.nn_model.float()
 
             self.nn_optimizer = optim.SGD(
-                self.nn_model.parameters(),
+                filter(
+                    lambda p: p.requires_grad,
+                    self.nn_model.parameters()
+                ),
                 lr=kwargs['nn_param']['nn_lr']
             )
 
@@ -229,35 +233,37 @@ class BoostNN:
                         )
                     )
 
-                    train_grad = torch.div(
-                        grad[:, channel_idx, first_dim_idx, second_dim_idx],
-                        abs_ave_of_grad
-                    )
+                    if abs_ave_of_grad > self.nonzero_constant:
 
-                    train_hess = torch.div(
-                        torch.add(
-                            hess[:, channel_idx, first_dim_idx, second_dim_idx],
-                            self.hessian_constant
-                        ),
-                        abs_ave_of_grad
-                    )
+                        train_grad = torch.div(
+                            grad[:, channel_idx, first_dim_idx, second_dim_idx],
+                            abs_ave_of_grad
+                        )
 
-                    self._add_booster_layer(
-                        channel_idx,
-                        first_dim_idx,
-                        second_dim_idx,
-                        lr
-                    )
+                        train_hess = torch.div(
+                            torch.add(
+                                hess[:, channel_idx, first_dim_idx, second_dim_idx],
+                                self.hessian_constant
+                            ),
+                            abs_ave_of_grad
+                        )
 
-                    self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
-                        1.0
-                    )
+                        self._add_booster_layer(
+                            channel_idx,
+                            first_dim_idx,
+                            second_dim_idx,
+                            lr
+                        )
 
-                    self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
-                        dmatrix,
-                        train_grad.numpy().tolist(),
-                        train_hess.numpy().tolist()
-                    )
+                        self.booster_layer_coef_list[channel_idx][first_dim_idx][second_dim_idx].append(
+                            1.0
+                        )
+
+                        self.booster_layer_list[channel_idx][first_dim_idx][second_dim_idx][-1].boost(
+                            dmatrix,
+                            train_grad.numpy().tolist(),
+                            train_hess.numpy().tolist()
+                        )
 
         return np.sum(self.newly_updated_booster_layer_list)
 

@@ -71,7 +71,7 @@ class LearnableTanh(nn.Module):
 
 class LearnableELU(nn.Module):
 
-    def __init__(self, alpha_upper_bound=1.0, inplace=False):
+    def __init__(self, alpha_upper_bound=0.1, inplace=False):
         super(LearnableELU, self).__init__()
         self.alpha = nn.parameter.Parameter(torch.Tensor(1))
         self.inplace = inplace
@@ -158,7 +158,7 @@ class AvePosLinear(nn.Module):
             self.weight.data.uniform_(-stdv, stdv)
             self.weight.data = self.fun.forward(self.weight.data)
             self.weight.data /= torch.sum(self.weight.data)
-            self.weight.data = self.fun.inverse(self.weight.data)
+            self.weight.data = self.fun.inverse(self.weight.data) / 10.0
         else:
             self.weight.data.uniform_(-stdv, stdv)
         if self.bias is not None:
@@ -178,6 +178,68 @@ class AvePosLinear(nn.Module):
             + 'NI: ' + str(self.normalized_init) + ', ' \
             + str(self.in_features) + ' -> ' \
             + str(self.out_features) + ')'
+
+
+class BoostAPLTMFullyCon(nn.Module):
+    def __init__(self, n_channel_to_nn, first_dim_to_nn, second_dim_to_nn,
+                 dim_of_hidden_layer_list, mask_prob, normalized_apl_init):
+
+        super(BoostAPLTMFullyCon, self).__init__()
+
+        self.n_channel_from_boosting = n_channel_to_nn
+        self.first_dim_from_boosting = first_dim_to_nn
+        self.second_dim_from_boosting = second_dim_to_nn
+
+        input_dim_list = (
+            [
+                n_channel_to_nn * first_dim_to_nn * second_dim_to_nn
+            ]
+            +
+            dim_of_hidden_layer_list
+        )
+        output_dim_list = (
+            dim_of_hidden_layer_list
+            +
+            [1]
+        )
+
+        self.layers = nn.Sequential()
+        for idx, input_output_dim in enumerate(zip(input_dim_list, output_dim_list)):
+            self.layers.add_module(
+                'mask_%d' % idx,
+                ConstantMask(
+                    input_output_dim[0],
+                    prob=mask_prob
+                )
+            )
+            self.layers.add_module(
+                'ltanh_%d' % idx,
+                LearnableTanh(
+                    input_output_dim[0]
+                )
+            )
+            self.layers.add_module(
+                'apl_%d' % idx,
+                AvePosLinear(
+                    input_output_dim[0],
+                    input_output_dim[1],
+                    normalized_init=normalized_apl_init
+                )
+            )
+
+    def forward(self, x):
+
+        x = x.view(
+            -1,
+            self.n_channel_from_boosting *
+            self.first_dim_from_boosting *
+            self.second_dim_from_boosting
+        )
+
+        for layer in self.layers:
+            x = layer(x)
+
+        return x
 
 
 class BoostFC(nn.Module):
